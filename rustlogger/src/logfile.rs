@@ -45,7 +45,16 @@ impl<W: Write> LogFile<W> {
     }
 
     /// Appends a chunk of the session's display output, stamping the
-    /// current time at the start of every line within it.
+    /// current time at the start of every line within it, and flushes
+    /// before returning. The flush matters: `W` is normally a
+    /// `BufWriter<File>` (see `session.rs`), and without it, nothing
+    /// written here would actually reach disk until the session ends and
+    /// `finish` flushes on its way out - fine for a log nobody reads
+    /// until the session is over, but headless tracking mode exists
+    /// specifically so something *else* (the rustlogger MCP server) can
+    /// check a still-running session's progress, which needs the log
+    /// current on disk while the session is still live, not just at the
+    /// end.
     pub fn write_output(&mut self, bytes: &[u8]) -> io::Result<()> {
         for &b in bytes {
             if self.at_line_start {
@@ -57,7 +66,7 @@ impl<W: Write> LogFile<W> {
                 self.at_line_start = true;
             }
         }
-        Ok(())
+        self.writer.flush()
     }
 
     /// Unwraps the underlying writer - only meant for tests that need to
@@ -98,6 +107,8 @@ impl<W: Write> LogFile<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::{BufWriter, Read};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -147,5 +158,45 @@ mod tests {
         assert!(text.contains("=== rustlogger session ended 2023-11-14T22:15:00Z ==="));
         assert!(text.contains("reason: shell exited"));
         assert!(text.contains("exit code: 7"));
+    }
+
+    #[test]
+    fn write_output_flushes_so_a_live_session_is_readable_before_finish() {
+        // A `Vec<u8>`-backed `LogFile` (as the other tests use) would not
+        // catch a missing flush - `Vec`'s `Write::flush` is a no-op, since
+        // there's no OS-level buffering to push through. This needs a
+        // real `BufWriter<File>`, and a *second*, independent handle on
+        // the same file to read back through, to actually exercise the
+        // thing that matters here: does the data reach disk without
+        // going through this same `LogFile` (e.g. without calling
+        // `finish`), the way `rustlogger-mcp-server` reads a still-running
+        // session's log from an entirely separate process.
+        let path = std::env::temp_dir().join(format!(
+            "rustlogger-logfile-flush-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = File::create(&path).expect("failed to create temp file");
+
+        let mut log = LogFile::new(BufWriter::new(file), "/bin/sh", "/dev/pts/0", UNIX_EPOCH)
+            .expect("failed to build log header");
+        log.write_output(b"still running\n")
+            .expect("write_output failed");
+
+        let mut independent_read = String::new();
+        File::open(&path)
+            .expect("failed to open temp file for independent read")
+            .read_to_string(&mut independent_read)
+            .expect("failed to read temp file");
+
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            independent_read.contains("still running"),
+            "expected write_output's bytes to already be on disk without calling finish, got: {independent_read:?}"
+        );
     }
 }

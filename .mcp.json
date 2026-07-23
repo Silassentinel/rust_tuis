@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rustlogger": {
+      "command": "node",
+      "args": ["rustlogger-mcp-server/dist/index.js"]
+    }
+  }
+}
