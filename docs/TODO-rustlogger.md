@@ -27,5 +27,19 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       the two behaviors that needed documenting along the way (the
       Linux pty EIO-vs-EOF quirk, and why ending the session sends the
       child SIGHUP instead of just detaching).
-- [ ] 5. Log file format: session header/footer, per-line timestamps.
+- [x] 5. Log file format (`timestamp.rs`, `logfile.rs`): session log named
+      `rustlogger-<UTC timestamp>.log` in the directory rustlogger is
+      launched from (confirmed with you 2026-07-23 rather than a fixed
+      dotfile location or a CLI-arg path). Header records start time,
+      shell, and tty; every line of the session's display output gets a
+      `[UTC timestamp]` prefix; footer records the stop reason and the
+      wrapped shell's exit code. Only the master→outer byte stream is
+      logged (not raw outer keystrokes) - see `docs/rustlogger-design.md`
+      for why that's actually the correct behavior, not a shortcut.
+      Timestamp formatting is hand-rolled against `std::time::SystemTime`
+      (no crate - see the doc comment in `timestamp.rs` and the checklist
+      rule in `CLAUDE.md`), unit-tested against known reference dates.
+      19/19 tests green (`cargo test -p rustlogger`); also smoke-tested
+      end-to-end through a real pty via `script(1)` (see
+      `docs/rustlogger-design.md`'s chunk 5 notes for the transcript).
 - [ ] 6. Integration tests + README for the `rustlogger` crate.

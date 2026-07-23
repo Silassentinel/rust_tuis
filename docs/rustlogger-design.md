@@ -95,3 +95,32 @@ wrapped shell exited), Linux fails the *next* `read()` on the master side with
 long-standing BSD-pty behavior Linux kept for compatibility, not a bug — do not
 gate "the child exited" detection on `Ok(0)` alone; check for `EIO` too. See the
 comment at the `master.read()` call in `rustlogger/src/session.rs`.
+
+## Chunk 5 notes: only the display stream gets logged, not raw keystrokes
+
+`logfile.rs` only ever sees the bytes flowing from the pty master back out to
+the real terminal (the same bytes `proxy_loop` writes to `outer_out`), never the
+raw bytes read from the outer terminal. This is deliberate, not a shortcut:
+
+- The inner pty's own terminal driver already echoes typed input back through
+  the master (see `pty_session.rs`'s doc comment and its test), so the master
+  stream is already a complete "what appeared on screen" transcript — the same
+  thing `script`(1) records.
+- It also means a prompt that turns terminal echo off for the duration of a
+  sensitive input, most commonly `sudo` asking for a password, is *never*
+  written to the log, because nothing was ever echoed to capture. Logging the
+  display stream rather than raw keystrokes gets this for free, without
+  special-casing "don't log passwords" — there's no reasonable way to
+  special-case that safely if raw input were logged instead.
+
+Log file name: `rustlogger-<UTC compact timestamp>.log`, written to whatever
+directory rustlogger is launched from (confirmed with the user 2026-07-23,
+over a fixed `~/.rustlogger/` location or a CLI-supplied path — either can be
+revisited later without changing the log format itself).
+
+Timestamp formatting (`timestamp.rs`) is hand-rolled against
+`std::time::SystemTime` — the date math is Howard Hinnant's well-known
+`civil_from_days` algorithm — rather than pulling in a time-formatting crate,
+per the crate-checklist rule in `CLAUDE.md`; a log timestamp doesn't need
+anything a chrono/time crate would offer beyond what a few lines of integer
+math already provides.

@@ -7,11 +7,13 @@
 //! conditions are wired up. Log file output itself is chunk 5. See
 //! `docs/rustlogger-design.md` for the architecture.
 
+mod logfile;
 mod pty_session;
 mod session;
 mod signals;
 mod stop_trigger;
 mod terminal;
+mod timestamp;
 
 fn main() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());

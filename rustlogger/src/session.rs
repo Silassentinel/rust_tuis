@@ -12,19 +12,23 @@
 //! pair, since both directions are small, interactive byte streams rather
 //! than independent long-running transfers).
 
+use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::os::fd::AsFd;
+use std::time::SystemTime;
 
 use nix::libc;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 
+use crate::logfile::LogFile;
 use crate::pty_session::PtySession;
 use crate::signals;
 use crate::stop_trigger::StopTrigger;
 use crate::terminal::RawGuard;
+use crate::timestamp::format_utc_compact;
 
 const BUF_SIZE: usize = 4096;
 
@@ -44,6 +48,17 @@ pub enum StopReason {
     Signal(Signal),
 }
 
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StopReason::StopPhrase => write!(f, "stoplogger command"),
+            StopReason::ChildExited => write!(f, "wrapped shell exited"),
+            StopReason::OuterClosed => write!(f, "outer terminal input closed"),
+            StopReason::Signal(sig) => write!(f, "caught signal {sig}"),
+        }
+    }
+}
+
 /// Copies bytes both ways between the outer terminal (`outer_in`/`outer_out`)
 /// and the wrapped shell's pty (`master`) until one of the stop conditions
 /// fires. Generic over the outer terminal's reader/writer, rather than
@@ -59,15 +74,17 @@ pub enum StopReason {
 /// `signals` module's flag are process-global, and cargo runs test
 /// functions on parallel threads within one process - a second test
 /// raising the same signals at an arbitrary time would race with it.
-pub fn proxy_loop<R, W>(
+pub fn proxy_loop<R, W, LW>(
     outer_in: &mut R,
     outer_out: &mut W,
     master: &mut File,
     trigger: &mut StopTrigger,
+    log: &mut LogFile<LW>,
 ) -> io::Result<StopReason>
 where
     R: Read + AsFd,
     W: Write,
+    LW: Write,
 {
     let mut buf = [0u8; BUF_SIZE];
 
@@ -121,18 +138,32 @@ where
             };
             outer_out.write_all(&buf[..n])?;
             outer_out.flush()?;
+            log.write_output(&buf[..n])?;
         }
     }
 }
 
 /// Runs a full session: spawns `shell` in a pty, raw-modes the real stdin,
-/// proxies until a stop condition fires, and returns the exit code
-/// rustlogger itself should exit with.
+/// proxies until a stop condition fires, logs the whole thing, and
+/// returns the exit code rustlogger itself should exit with.
 pub fn run(shell: &str) -> io::Result<i32> {
     signals::install().map_err(nix_err_to_io)?;
 
     let mut session = PtySession::spawn(shell)?;
     let mut trigger = StopTrigger::new();
+
+    let started_at = SystemTime::now();
+    let log_path = format!("rustlogger-{}.log", format_utc_compact(started_at));
+    let tty = nix::unistd::ttyname(io::stdin())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let mut log = LogFile::new(
+        BufWriter::new(File::create(&log_path)?),
+        shell,
+        &tty,
+        started_at,
+    )?;
+    eprintln!("rustlogger: logging session to {log_path}");
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -145,27 +176,37 @@ pub fn run(shell: &str) -> io::Result<i32> {
     let reason = {
         let mut stdin_lock = stdin.lock();
         let mut stdout_lock = stdout.lock();
-        proxy_loop(&mut stdin_lock, &mut stdout_lock, &mut session.master, &mut trigger)?
+        proxy_loop(
+            &mut stdin_lock,
+            &mut stdout_lock,
+            &mut session.master,
+            &mut trigger,
+            &mut log,
+        )?
     };
 
-    match reason {
-        StopReason::ChildExited => Ok(session.wait()?.unwrap_or(1)),
+    let (exit_code, child_code) = match reason {
+        StopReason::ChildExited => {
+            let code = session.wait()?;
+            (code.unwrap_or(1), code)
+        }
         StopReason::StopPhrase => {
             terminate_child(&session)?;
-            session.wait()?;
-            Ok(0)
+            (0, session.wait()?)
         }
         StopReason::OuterClosed => {
             terminate_child(&session)?;
-            session.wait()?;
-            Ok(1)
+            (1, session.wait()?)
         }
         StopReason::Signal(sig) => {
             terminate_child(&session)?;
-            session.wait()?;
-            Ok(128 + sig as i32)
+            (128 + sig as i32, session.wait()?)
         }
-    }
+    };
+
+    log.finish(&reason.to_string(), child_code, SystemTime::now())?;
+
+    Ok(exit_code)
 }
 
 /// Sends `SIGHUP` to the wrapped shell - the same signal it would get from
@@ -186,6 +227,11 @@ mod tests {
     use super::*;
     use std::io::pipe;
 
+    fn test_log() -> LogFile<Vec<u8>> {
+        LogFile::new(Vec::new(), "/bin/sh", "test", SystemTime::UNIX_EPOCH)
+            .expect("failed to build test log")
+    }
+
     #[test]
     fn stop_phrase_ends_the_loop_immediately() {
         let mut session = PtySession::spawn("/bin/sh").expect("failed to spawn shell");
@@ -197,11 +243,13 @@ mod tests {
             .expect("failed to write trigger phrase");
 
         let mut trigger = StopTrigger::new();
+        let mut log = test_log();
         let reason = proxy_loop(
             &mut outer_in_reader,
             &mut outer_out_writer,
             &mut session.master,
             &mut trigger,
+            &mut log,
         )
         .expect("proxy_loop failed");
 
@@ -225,16 +273,24 @@ mod tests {
             .expect("failed to write exit to pty master");
 
         let mut trigger = StopTrigger::new();
+        let mut log = test_log();
         let reason = proxy_loop(
             &mut outer_in_reader,
             &mut outer_out_writer,
             &mut session.master,
             &mut trigger,
+            &mut log,
         )
         .expect("proxy_loop failed");
 
         assert_eq!(reason, StopReason::ChildExited);
         assert_eq!(session.wait().expect("failed to reap child"), Some(7));
+
+        let logged = String::from_utf8(log.into_writer()).unwrap();
+        assert!(
+            logged.contains("exit 7"),
+            "expected the echoed shell output in the log, got: {logged:?}"
+        );
     }
 
     #[test]
@@ -245,11 +301,13 @@ mod tests {
         let (_outer_out_reader, mut outer_out_writer) = pipe().expect("failed to create pipe");
 
         let mut trigger = StopTrigger::new();
+        let mut log = test_log();
         let reason = proxy_loop(
             &mut outer_in_reader,
             &mut outer_out_writer,
             &mut session.master,
             &mut trigger,
+            &mut log,
         )
         .expect("proxy_loop failed");
 
