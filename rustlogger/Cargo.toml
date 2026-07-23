@@ -1,0 +1,14 @@
+[package]
+name = "rustlogger"
+version = "0.1.0"
+edition = "2021"
+description = "Wraps the shell in the terminal it's launched from and logs the whole session to a file until stopped."
+
+[dependencies]
+# Approved 2026-07-23, see docs/crate-checklist.md ("rustlogger: pseudo-terminal
+# (pty) handling") for the why/what/how. "term" (pty + termios) landed in
+# chunk 3. "process"/"signal"/"poll" approved 2026-07-23 for chunk 4 (see
+# the follow-up entry in crate-checklist.md): process for waitpid/WaitStatus
+# (exit code vs killing signal), signal for SIGINT/SIGHUP/SIGTERM handlers,
+# poll for multiplexing the outer-stdin / pty-master proxy loop.
+nix = { version = "0.31", features = ["term", "process", "signal", "poll"] }
