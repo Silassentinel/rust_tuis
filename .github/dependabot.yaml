@@ -1,0 +1,8 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/rustlogger-mcp-server"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "rustlogger-mcp-server"
