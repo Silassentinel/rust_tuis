@@ -115,7 +115,7 @@ fn wraps_a_short_shell_session_and_logs_it() {
         log.contains("=== rustlogger session ended "),
         "log is missing its footer: {log:?}"
     );
-    assert!(log.contains("reason: wrapped shell exited"), "log: {log:?}");
+    assert!(log.contains("reason: process exited"), "log: {log:?}");
     assert!(log.contains("exit code: 4"), "log: {log:?}");
 }
 
@@ -148,4 +148,52 @@ fn stoplogger_ends_the_session_and_records_it_as_the_reason() {
 
     let log = read_the_log_file(&scratch.path);
     assert!(log.contains("reason: stoplogger command"), "log: {log:?}");
+}
+
+#[test]
+fn headless_mode_tracks_a_command_given_directly_on_argv() {
+    let scratch = ScratchDir::create("headless");
+
+    // Headless mode doesn't touch rustlogger's own controlling terminal
+    // (see session::run_headless), so unlike the interactive-mode tests
+    // above, it doesn't need PtySession::spawn_command to give rustlogger
+    // itself a pty - a plain child process with piped output is enough.
+    let output = Command::new(env!("CARGO_BIN_EXE_rustlogger"))
+        .arg("echo")
+        .arg("integration-headless-marker")
+        .current_dir(&scratch.path)
+        .output()
+        .expect("failed to run rustlogger in headless mode");
+
+    assert!(
+        output.status.success(),
+        "rustlogger exited with {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tracking `echo integration-headless-marker`"),
+        "stderr: {stderr:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("integration-headless-marker"),
+        "expected the tracked command's output mirrored to stdout, got: {stdout:?}"
+    );
+
+    let log = read_the_log_file(&scratch.path);
+    assert!(
+        log.contains("shell: echo integration-headless-marker"),
+        "log: {log:?}"
+    );
+    assert!(log.contains("tty: /dev/pts/"), "log: {log:?}");
+    assert!(
+        log.contains("integration-headless-marker"),
+        "log is missing the tracked command's output: {log:?}"
+    );
+    assert!(log.contains("reason: process exited"), "log: {log:?}");
+    assert!(log.contains("exit code: 0"), "log: {log:?}");
 }

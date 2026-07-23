@@ -12,6 +12,11 @@ file. Logging stops, and the log file is closed cleanly, when any of these happe
 - the session ends any other way: Ctrl+C, the terminal window/tab is closed, the
   connection drops (SIGHUP), or the process is killed (SIGTERM)
 
+There's also a headless mode, `rustlogger <command> [args...]`, for when nothing
+is sitting at a live terminal to type `stoplogger` or hit Ctrl+C — see chunk 7's
+notes below. It's what the rustlogger MCP server (`rustlogger-mcp-server/`) uses
+to let Claude track a program in the background and check its log later.
+
 ## Non-goals (for now)
 
 - Not a replacement for full asciinema-style timing/playback — plain text log first,
@@ -56,6 +61,8 @@ docs updated before moving to the next, per project convention.
    (stop reason + exit code), timestamps per line.
 6. **Integration tests + README** — end-to-end test spawning a short-lived
    shell command, docs finalized.
+7. **Headless tracking mode** — run a specific command instead of `$SHELL`,
+   with no outer terminal involved, for the MCP server to drive.
 
 ## Rust Book references
 
@@ -139,3 +146,52 @@ existing `spawn`, taking a pre-configured `Command` instead of just a shell
 path) rather than duplicating the `setsid`/`TIOCSCTTY`/`dup2` dance a second
 time in the test. That reuse is only possible because `pty_session` (and
 everything else) is now part of a library crate integration tests can `use`.
+
+## Chunk 7 notes: headless tracking mode is a different shape, not just interactive-mode-minus-a-terminal
+
+Interactive mode (`session::run`) exists to sit between a live human and a
+shell: it raw-modes a *real* terminal, watches for the `stoplogger` phrase in
+what that human types, and forwards their keystrokes. Headless mode
+(`session::run_headless`) has none of that, because there's no human on the
+other end — it's meant to be started by something else (the rustlogger MCP
+server, `rustlogger-mcp-server/`) that wants to run one specific command in
+the background and check its log later. Concretely:
+
+- No outer terminal is touched at all — no `RawGuard`, no raw-moding of
+  rustlogger's own stdin. There isn't an "outer" side in this mode; there's
+  just the tracked command's own pty.
+- No `stoplogger` detection — there's no live keystroke stream to feed a
+  `StopTrigger`. "Stop tracking" instead means sending rustlogger itself a
+  signal (`SIGTERM`, typically), which it already handles the same way
+  interactive mode does: send the tracked command `SIGHUP`, reap it, write
+  the log's footer, exit. The MCP server's "stop tracking" tool is just
+  `kill <pid>`.
+- The command being tracked is still run attached to a pty (via the same
+  `PtySession::spawn_command`), not a plain pipe — programs that check
+  `isatty()` to decide whether to show progress bars or colored output
+  behave the same way they would run directly in a terminal.
+- Output is both logged and mirrored to rustlogger's own stdout, so running
+  `rustlogger some-command` directly in a terminal (rather than through the
+  MCP server) still shows you what's happening live, in addition to logging
+  it.
+
+`proxy_loop` (interactive) and `headless_loop` (headless) are two distinct
+loops for this reason — trying to make one generic over "is there an outer
+terminal or not" would have been a worse abstraction than two loops that
+share their genuinely-common parts: `read_master` (the `EIO`-vs-`EOF`
+handling described above) and `finish_session` (turning a `StopReason` into
+"kill the child if it didn't already exit, reap it, write the footer, work
+out rustlogger's own exit code").
+
+**Getting the tracked command's tty path required a small `pty_session.rs`
+fix.** The natural-seeming `nix::unistd::ttyname(&session.master)` doesn't
+give the slave's path (e.g. `/dev/pts/7`) — called on the *master* fd,
+`ttyname()` returns `/dev/ptmx`, the pty control device, because the master
+isn't itself "a terminal" in the sense that function cares about. The slave
+fd is the only side that reports its own real path, and `spawn_command`
+drops the parent's copy of that fd once the child has its own (duped onto
+its 0/1/2) — so the name has to be captured right after `openpty()`, before
+that happens. `PtySession` now carries it as a `pub tty: String` field.
+Interactive mode doesn't use this field (it still reports the *outer* real
+terminal's path, which is a different, correct thing to want there); only
+headless mode needed it.

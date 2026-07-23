@@ -49,7 +49,7 @@ tty: /dev/pts/4
 [2026-07-23T14:32:09Z] hello
 [2026-07-23T14:32:12Z] $ exit
 === rustlogger session ended 2026-07-23T14:32:12Z ===
-reason: wrapped shell exited
+reason: process exited
 exit code: 0
 ```
 
@@ -58,6 +58,23 @@ means a prompt that turns off terminal echo (most commonly `sudo` asking for
 a password) is never captured, since nothing was ever echoed to log. See
 `docs/rustlogger-design.md`'s chunk 5 notes for why that's the correct
 behavior rather than a limitation.
+
+## Headless tracking mode
+
+```bash
+rustlogger <command> [args...]
+```
+
+Runs `command` (not your shell) attached to a pty with no outer terminal
+touched at all — no raw terminal mode, no `stoplogger` phrase (there's no
+live keystroke stream to watch for it). Output is logged the same way and
+also mirrored to rustlogger's own stdout. The session ends when `command`
+exits, or when rustlogger itself is sent `SIGINT`/`SIGHUP`/`SIGTERM` (the
+tracked command gets `SIGHUP` first, so it isn't left running).
+
+This is what the [rustlogger MCP server](../rustlogger-mcp-server/README.md)
+uses to let Claude start a program in the background, check its log later,
+and stop it — see that project's README for the tools it exposes.
 
 ## Development
 

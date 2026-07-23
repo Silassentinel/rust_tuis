@@ -81,7 +81,30 @@ Then check the log:
 cat rustlogger-20260723-143207.log
 ```
 
-## 4. Troubleshooting
+## 4. Headless tracking mode (for scripting, or the MCP server)
+
+```bash
+./target/release/rustlogger npm run build
+```
+
+Runs `npm run build` (in place of your shell) attached to a pty, logs it the
+same way, and also mirrors its output to rustlogger's own stdout — but
+touches no outer terminal: no raw mode, no `stoplogger` detection (there's
+no live keystroke stream to watch for it). To end it early, send rustlogger
+itself a signal:
+
+```bash
+kill <pid>
+```
+
+which sends the tracked command `SIGHUP` first, so it isn't left running
+detached, then reaps it and closes the log with that as the recorded reason.
+
+This is what the `rustlogger-mcp-server` project (alongside this one) uses
+to let Claude start a program in the background and check its log later —
+see that project's own README for the tools it exposes.
+
+## 5. Troubleshooting
 
 - **`man rustlogger` says "No manual entry"**: run `manpath` and confirm the
   directory you installed into (Option A or B above) is actually listed. If

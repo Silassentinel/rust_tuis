@@ -3,7 +3,12 @@
 rustlogger \- wrap the current shell in a pseudo\-terminal and log the whole session to a file
 .SH SYNOPSIS
 .B rustlogger
+.br
+.B rustlogger
+.I command
+.RI [ arg " ...]"
 .SH DESCRIPTION
+With no arguments,
 .B rustlogger
 runs your shell attached to a real pseudo\-terminal (pty), exactly the way
 .BR script (1)
@@ -11,15 +16,27 @@ does, so interactive programs, colors, job control, and
 .B sudo
 prompts all behave normally. Everything that appears on screen \(em commands
 as they're echoed back and all their output \(em is written to a per\-session
-log file at the same time, until the session is stopped.
-.PP
-.B rustlogger
-takes no command\-line options. It reads the
+log file at the same time, until the session is stopped. It reads the
 .B SHELL
 environment variable to decide what to run (falling back to
 .I /bin/sh
-if unset), and always logs into the directory it was launched from.
+if unset).
+.PP
+Given a
+.I command
+(and optionally its arguments), rustlogger instead tracks that one command
+headlessly \(em see
+.B HEADLESS TRACKING MODE
+below.
+.PP
+Either way, rustlogger always logs into the directory it was launched from.
 .SH STOP CONDITIONS
+These apply to the no\-argument, interactive form. Headless tracking mode
+(see below) only ever stops via
+.B the wrapped shell exits
+(there, the tracked command) or
+.BR "a caught signal" .
+.PP
 A session ends, and the log file is closed, when any of the following happens:
 .TP
 .B the wrapped shell exits
@@ -63,7 +80,7 @@ tty: /dev/pts/4
 [2026\-07\-23T14:32:09Z] hello
 [2026\-07\-23T14:32:12Z] $ exit
 === rustlogger session ended 2026\-07\-23T14:32:12Z ===
-reason: wrapped shell exited
+reason: process exited
 exit code: 0
 .fi
 .RE
@@ -74,10 +91,38 @@ commonly
 .B sudo
 asking for a password \(em is therefore never captured, since nothing was
 ever echoed to log. This is deliberate, not a limitation.
+.SH HEADLESS TRACKING MODE
+.B rustlogger
+.I command
+.RI [ arg " ...]"
+runs
+.I command
+(with its arguments) attached to a pty, the same as interactive mode, but
+touches no outer terminal at all: no raw terminal mode, and no
+.B stoplogger
+phrase detection, since there's no live keystroke stream to watch for it.
+Output is logged exactly as in interactive mode and also mirrored to
+.BR rustlogger 's
+own stdout. The session ends when
+.I command
+exits on its own, or when
+.B rustlogger
+itself is sent
+.BR SIGINT ", " SIGHUP ", or " SIGTERM
+(the tracked command is sent
+.B SIGHUP
+first, so it isn't left running).
+.PP
+This mode exists for driving
+.B rustlogger
+from something other than a live terminal \(em see the
+.B rustlogger\-mcp\-server
+project alongside this one, which lets Claude start a tracked command in the
+background, check its log later, and stop it.
 .SH EXIT STATUS
 .TP
-.B the wrapped shell's own exit code
-When the session ends because the shell exited on its own.
+.B the wrapped shell's (or tracked command's) own exit code
+When the session ends because it exited on its own.
 .TP
 .B 0
 When the session ends via the
@@ -97,11 +142,14 @@ On an unexpected I/O error, or if the outer terminal's input closes out from
 under the session.
 .SH EXAMPLES
 .TP
-Start a logged session with your normal shell:
+Start a logged interactive session with your normal shell:
 .B rustlogger
 .TP
-Start a logged session with a specific shell:
+Start a logged interactive session with a specific shell:
 .B SHELL=/bin/bash rustlogger
+.TP
+Track a build in the background and log it, headlessly:
+.B rustlogger npm run build
 .SH LIMITATIONS
 .IP \(bu 2
 Linux only.
@@ -109,8 +157,8 @@ Linux only.
 Not a replacement for full asciinema\-style timing/playback \(em this is a
 plain\-text transcript, not a recorded\-and\-replayable format.
 .IP \(bu 2
-No command\-line options yet: the log's destination directory and name
-aren't configurable.
+The log's destination directory and name aren't configurable \(em always
+the launch directory, named after the UTC start time.
 .IP \(bu 2
 No terminal window\-resize
 .RB ( SIGWINCH )

@@ -53,3 +53,20 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       stop conditions, and the log format. 21/21 tests green (19 unit +
       2 integration, `cargo test -p rustlogger`), stable across repeated
       runs.
+- [x] 7. Headless tracking mode: `rustlogger <command> [args...]` runs
+      `command` (not `$SHELL`) attached to a pty with no outer terminal
+      touched at all - no raw-moding, no `stoplogger` detection (there's
+      no live keystroke stream to watch), just the command's pty output
+      logged and mirrored to rustlogger's own stdout until it exits or
+      rustlogger is signaled to stop (see `session::run_headless` and
+      `docs/rustlogger-design.md`'s chunk 7 notes for why, and for the
+      `PtySession::tty` field this needed - `ttyname()` on a pty *master*
+      fd reports `/dev/ptmx`, not the slave's real path, so the slave's
+      name has to be captured before it's dropped). Added to support the
+      rustlogger MCP server (`rustlogger-mcp-server/`, own README) that
+      lets Claude start/check/stop a tracked program in the background.
+      Refactored `read_master`'s `EIO`-vs-`EOF` handling and the
+      stop-reason-to-exit-code logic (`finish_session`) out of
+      interactive mode so headless mode reuses both rather than
+      duplicating them. 23/23 tests green (20 unit + 3 integration,
+      `cargo test -p rustlogger`), stable across repeated runs.

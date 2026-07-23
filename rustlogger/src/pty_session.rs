@@ -24,6 +24,13 @@ use nix::pty::openpty;
 pub struct PtySession {
     pub child: Child,
     pub master: File,
+    /// The slave side's device path (e.g. `/dev/pts/4`). Captured here
+    /// because `nix::unistd::ttyname` on the *master* fd returns
+    /// `/dev/ptmx` (the control device), not the slave path - the slave
+    /// fd itself is the only thing that reports it, and `spawn_command`
+    /// closes that fd on the parent's side once the child has its own
+    /// copy, so it has to be captured before that happens.
+    pub tty: String,
 }
 
 impl PtySession {
@@ -41,6 +48,9 @@ impl PtySession {
     pub fn spawn_command(mut command: Command) -> io::Result<Self> {
         let pty = openpty(None, None).map_err(nix_err_to_io)?;
         let slave_fd = pty.slave.as_raw_fd();
+        let tty = nix::unistd::ttyname(&pty.slave)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
 
         command
             .stdin(Stdio::null())
@@ -82,7 +92,7 @@ impl PtySession {
         drop(pty.slave);
 
         let master = File::from(pty.master);
-        Ok(PtySession { child, master })
+        Ok(PtySession { child, master, tty })
     }
 
     /// Block until the wrapped shell exits, returning its exit code.

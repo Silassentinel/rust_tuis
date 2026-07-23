@@ -35,14 +35,17 @@ const BUF_SIZE: usize = 4096;
 /// Why the session loop stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// The user typed the `stoplogger` trigger phrase.
+    /// The user typed the `stoplogger` trigger phrase. Only reachable in
+    /// interactive mode (`run`) - headless mode (`run_headless`) has no
+    /// live outer keystroke stream to watch for it.
     StopPhrase,
-    /// The wrapped shell exited on its own (the pty's master side hit EOF).
+    /// The wrapped shell or tracked command exited on its own (the pty's
+    /// master side hit EOF).
     ChildExited,
     /// The outer terminal's input closed from under us - not one of the
     /// documented stop conditions, but reading 0 bytes forever in a loop
     /// would spin, so it's treated as an implicit "session ends any other
-    /// way" case.
+    /// way" case. Only reachable in interactive mode.
     OuterClosed,
     /// rustlogger itself received `SIGINT`/`SIGHUP`/`SIGTERM`.
     Signal(Signal),
@@ -52,10 +55,26 @@ impl fmt::Display for StopReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StopReason::StopPhrase => write!(f, "stoplogger command"),
-            StopReason::ChildExited => write!(f, "wrapped shell exited"),
+            StopReason::ChildExited => write!(f, "process exited"),
             StopReason::OuterClosed => write!(f, "outer terminal input closed"),
             StopReason::Signal(sig) => write!(f, "caught signal {sig}"),
         }
+    }
+}
+
+/// Reads from the pty master, treating both a clean 0-byte read and the
+/// `EIO`-at-EOF quirk (see the comment this used to carry inline - once
+/// every fd pointing at the pty's slave side is closed, Linux fails the
+/// *next* master read with `EIO` rather than returning `Ok(0)` the way a
+/// pipe would) as "the child has exited" rather than distinct data/error
+/// cases. Shared between `proxy_loop` and `headless_loop` so this subtlety
+/// only has to be handled once.
+fn read_master(master: &mut File, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    match master.read(buf) {
+        Ok(0) => Ok(None),
+        Ok(n) => Ok(Some(n)),
+        Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -123,22 +142,54 @@ where
         }
 
         if master_ready {
-            // Once the child has closed every fd pointing at the pty's
-            // slave side (typically because it exited), Linux reports
-            // that on the master by failing the *next* read with `EIO`
-            // rather than returning a clean 0-byte EOF like a pipe would -
-            // a longstanding BSD-pty quirk Linux kept for compatibility.
-            let n = match master.read(&mut buf) {
-                Ok(0) => return Ok(StopReason::ChildExited),
-                Ok(n) => n,
-                Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                    return Ok(StopReason::ChildExited);
+            match read_master(master, &mut buf)? {
+                None => return Ok(StopReason::ChildExited),
+                Some(n) => {
+                    outer_out.write_all(&buf[..n])?;
+                    outer_out.flush()?;
+                    log.write_output(&buf[..n])?;
                 }
-                Err(e) => return Err(e),
-            };
-            outer_out.write_all(&buf[..n])?;
-            outer_out.flush()?;
-            log.write_output(&buf[..n])?;
+            }
+        }
+    }
+}
+
+/// Like `proxy_loop`, but for headless tracking (`run_headless`): there's
+/// no live outer terminal to proxy input from or watch for the
+/// `stoplogger` phrase, just the tracked command's own pty output, which
+/// gets logged and mirrored to rustlogger's own stdout (harmless, and
+/// useful if rustlogger is run directly rather than backgrounded by
+/// something else). Only `ChildExited` and `Signal` are reachable here.
+fn headless_loop<LW: Write>(
+    session: &mut PtySession,
+    log: &mut LogFile<LW>,
+) -> io::Result<StopReason> {
+    let mut buf = [0u8; BUF_SIZE];
+    let mut stdout = io::stdout();
+
+    loop {
+        {
+            let mut fds = [PollFd::new(session.master.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::Error::EINTR) => {
+                    if let Some(sig) = signals::received() {
+                        return Ok(StopReason::Signal(sig));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+
+        match read_master(&mut session.master, &mut buf)? {
+            None => return Ok(StopReason::ChildExited),
+            Some(n) => {
+                let chunk = &buf[..n];
+                stdout.write_all(chunk)?;
+                stdout.flush()?;
+                log.write_output(chunk)?;
+            }
         }
     }
 }
@@ -185,21 +236,66 @@ pub fn run(shell: &str) -> io::Result<i32> {
         )?
     };
 
+    finish_session(&mut session, &mut log, reason)
+}
+
+/// Runs a headless tracked session: spawns `command` (with `args`) in a
+/// pty - no outer terminal is touched at all, since headless tracking is
+/// meant to be driven by something else (e.g. the rustlogger MCP server)
+/// rather than a human sitting at a live terminal. Logs the whole thing
+/// and mirrors it to rustlogger's own stdout, until the command exits or
+/// rustlogger itself is signaled to stop tracking (typically via
+/// `SIGTERM`, which is what the MCP server's "stop tracking" tool sends).
+pub fn run_headless(command: &str, args: &[String]) -> io::Result<i32> {
+    signals::install().map_err(nix_err_to_io)?;
+
+    let mut cmd = std::process::Command::new(command);
+    cmd.args(args);
+    let mut session = PtySession::spawn_command(cmd)?;
+
+    let started_at = SystemTime::now();
+    let log_path = format!("rustlogger-{}.log", format_utc_compact(started_at));
+    let command_line = std::iter::once(command.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut log = LogFile::new(
+        BufWriter::new(File::create(&log_path)?),
+        &command_line,
+        &session.tty,
+        started_at,
+    )?;
+    eprintln!("rustlogger: tracking `{command_line}`, logging to {log_path}");
+
+    let reason = headless_loop(&mut session, &mut log)?;
+
+    finish_session(&mut session, &mut log, reason)
+}
+
+/// Shared tail end of both `run` and `run_headless`: reacts to the stop
+/// reason (killing the tracked process first if the session didn't end on
+/// its own), reaps it, writes the log's footer, and returns the exit code
+/// rustlogger itself should exit with.
+fn finish_session<LW: Write>(
+    session: &mut PtySession,
+    log: &mut LogFile<LW>,
+    reason: StopReason,
+) -> io::Result<i32> {
     let (exit_code, child_code) = match reason {
         StopReason::ChildExited => {
             let code = session.wait()?;
             (code.unwrap_or(1), code)
         }
         StopReason::StopPhrase => {
-            terminate_child(&session)?;
+            terminate_child(session)?;
             (0, session.wait()?)
         }
         StopReason::OuterClosed => {
-            terminate_child(&session)?;
+            terminate_child(session)?;
             (1, session.wait()?)
         }
         StopReason::Signal(sig) => {
-            terminate_child(&session)?;
+            terminate_child(session)?;
             (128 + sig as i32, session.wait()?)
         }
     };
@@ -209,10 +305,10 @@ pub fn run(shell: &str) -> io::Result<i32> {
     Ok(exit_code)
 }
 
-/// Sends `SIGHUP` to the wrapped shell - the same signal it would get from
-/// a real terminal hanging up - so ending the rustlogger session doesn't
-/// leave the shell running, detached from anything, connected to a pty
-/// nobody is proxying any more.
+/// Sends `SIGHUP` to the wrapped shell or tracked command - the same
+/// signal it would get from a real terminal hanging up - so ending the
+/// rustlogger session doesn't leave it running, detached from anything,
+/// connected to a pty nobody is proxying any more.
 fn terminate_child(session: &PtySession) -> io::Result<()> {
     let pid = Pid::from_raw(session.child.id() as i32);
     signal::kill(pid, Signal::SIGHUP).map_err(nix_err_to_io)
@@ -315,5 +411,33 @@ mod tests {
 
         terminate_child(&session).expect("failed to send SIGHUP to child");
         session.wait().expect("failed to reap child");
+    }
+
+    #[test]
+    fn headless_loop_captures_output_and_reports_child_exited() {
+        let mut echo_command = std::process::Command::new("/bin/echo");
+        echo_command.arg("hello-headless");
+        let mut session = PtySession::spawn_command(echo_command)
+            .expect("failed to spawn /bin/echo in a pty");
+
+        let mut log = test_log();
+        let reason =
+            headless_loop(&mut session, &mut log).expect("headless_loop failed");
+
+        assert_eq!(reason, StopReason::ChildExited);
+
+        let exit_code = finish_session(&mut session, &mut log, reason)
+            .expect("finish_session failed");
+        assert_eq!(exit_code, 0);
+
+        let logged = String::from_utf8(log.into_writer()).unwrap();
+        assert!(
+            logged.contains("hello-headless"),
+            "expected the command's output in the log, got: {logged:?}"
+        );
+        assert!(
+            logged.contains("reason: process exited"),
+            "log: {logged:?}"
+        );
     }
 }
