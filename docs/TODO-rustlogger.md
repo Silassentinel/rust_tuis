@@ -42,4 +42,14 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       19/19 tests green (`cargo test -p rustlogger`); also smoke-tested
       end-to-end through a real pty via `script(1)` (see
       `docs/rustlogger-design.md`'s chunk 5 notes for the transcript).
-- [ ] 6. Integration tests + README for the `rustlogger` crate.
+- [x] 6. Integration tests + README. Split `main.rs` into a thin binary
+      over a new `lib.rs` (Ch. 12 `minigrep` pattern, see
+      `docs/rustlogger-design.md`'s chunk 6 notes) so
+      `tests/session_end_to_end.rs` can spawn the *compiled `rustlogger`
+      binary* under a real pty via a generalized
+      `PtySession::spawn_command` and check both its exit code and the
+      log file it produces, for both the shell-exits-on-its-own and
+      `stoplogger` stop conditions. `README.md` added covering usage, the
+      stop conditions, and the log format. 21/21 tests green (19 unit +
+      2 integration, `cargo test -p rustlogger`), stable across repeated
+      runs.

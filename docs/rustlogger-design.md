@@ -124,3 +124,18 @@ Timestamp formatting (`timestamp.rs`) is hand-rolled against
 per the crate-checklist rule in `CLAUDE.md`; a log timestamp doesn't need
 anything a chrono/time crate would offer beyond what a few lines of integer
 math already provides.
+
+## Chunk 6 notes: split into `lib.rs` + a thin `main.rs`
+
+All the modules moved from `main.rs` into a new `lib.rs`, leaving `main.rs` as
+a few lines calling `rustlogger::session::run`. This is the same
+extract-binary-logic-into-a-library-crate pattern Ch. 12 (`minigrep`) teaches,
+already cited as the reason for this project's structure back in chunk 1 — it
+just took until chunk 6 to actually need it: the end-to-end integration test
+(`tests/session_end_to_end.rs`) spawns the *compiled `rustlogger` binary*
+itself attached to a real pty, and does so by reusing
+`pty_session::PtySession::spawn_command` (a small generalization of the
+existing `spawn`, taking a pre-configured `Command` instead of just a shell
+path) rather than duplicating the `setsid`/`TIOCSCTTY`/`dup2` dance a second
+time in the test. That reuse is only possible because `pty_session` (and
+everything else) is now part of a library crate integration tests can `use`.

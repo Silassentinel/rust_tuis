@@ -30,10 +30,18 @@ impl PtySession {
     /// Spawn `shell` (e.g. `/bin/bash`, or whatever `$SHELL` resolves to)
     /// attached to a new pty.
     pub fn spawn(shell: &str) -> io::Result<Self> {
+        Self::spawn_command(Command::new(shell))
+    }
+
+    /// Like `spawn`, but takes an already-configured `Command` - lets
+    /// callers set args/env/cwd before the pty wiring happens. Used by the
+    /// integration tests under `tests/` to spawn the compiled
+    /// `rustlogger` binary itself (rather than a plain shell) attached to
+    /// a real controlling terminal.
+    pub fn spawn_command(mut command: Command) -> io::Result<Self> {
         let pty = openpty(None, None).map_err(nix_err_to_io)?;
         let slave_fd = pty.slave.as_raw_fd();
 
-        let mut command = Command::new(shell);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
