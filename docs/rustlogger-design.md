@@ -74,3 +74,24 @@ docs updated before moving to the next, per project convention.
   editing while typing `stoplogger` is not specially handled yet.
 - Window resize (SIGWINCH) propagation to the inner pty isn't in scope until a
   later chunk — the wrapped shell just won't resize until then.
+
+## Chunk 4 notes: ending a session doesn't mean leaving the shell running
+
+All three ways a session can end other than the wrapped shell exiting on its own
+(the `stoplogger` phrase, the outer terminal's input closing, rustlogger catching
+SIGINT/HUP/TERM) send the wrapped shell `SIGHUP` before reaping it
+(`session::terminate_child`). Simply stopping the proxy loop and exiting
+rustlogger without this would leave the shell alive, attached to a pty nobody is
+copying bytes to/from any more — effectively orphaned rather than actually
+stopped. `SIGHUP` mirrors what the shell would receive if a real terminal had
+hung up, which is the closest real-world equivalent to what rustlogger detaching
+represents.
+
+## Chunk 4 notes: pty EOF shows up as `EIO`, not a clean 0-byte read
+
+Once every fd referring to the pty's slave side is closed (normally because the
+wrapped shell exited), Linux fails the *next* `read()` on the master side with
+`EIO` rather than returning `Ok(0)` the way a pipe would at EOF. This is a
+long-standing BSD-pty behavior Linux kept for compatibility, not a bug — do not
+gate "the child exited" detection on `Ok(0)` alone; check for `EIO` too. See the
+comment at the `master.read()` call in `rustlogger/src/session.rs`.
