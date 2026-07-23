@@ -21,7 +21,9 @@ to let Claude track a program in the background and check its log later.
 
 - Not a replacement for full asciinema-style timing/playback — plain text log first,
   playback format is a later chunk if wanted.
-- Not cross-platform — Linux only, matching where it'll actually run.
+- Cross-platform support is in progress (chunks 8-9) but not there yet: Android via
+  Termux type-checks but hasn't been run on a real device, and native Windows (via
+  ConPTY) hasn't been started. Today it only actually runs on desktop Linux.
 
 ## Architecture
 
@@ -63,6 +65,13 @@ docs updated before moving to the next, per project convention.
    shell command, docs finalized.
 7. **Headless tracking mode** — run a specific command instead of `$SHELL`,
    with no outer terminal involved, for the MCP server to drive.
+8. **Cross-platform, part 1: Android via Termux** — verify (ideally on a real
+   device) that today's POSIX-based code actually works under Termux, not
+   just that it type-checks for the target. See
+   `docs/rustlogger-android-termux.md`.
+9. **Cross-platform, part 2: native Windows console** — a second
+   pty/terminal/signal backend using ConPTY, selected by `cfg(windows)`.
+   Its own crate decision, subject to `docs/crate-checklist.md`.
 
 ## Rust Book references
 
@@ -195,3 +204,25 @@ that happens. `PtySession` now carries it as a `pub tty: String` field.
 Interactive mode doesn't use this field (it still reports the *outer* real
 terminal's path, which is a different, correct thing to want there); only
 headless mode needed it.
+
+## Chunk 8 notes: "type-checks for Android" is not the same claim as "works on Android"
+
+`cargo check --target aarch64-linux-android` and `--target armv7-linux-androideabi`
+both pass with zero source changes — every `nix` API rustlogger uses
+(`openpty`, `cfmakeraw`/`tcgetattr`/`tcsetattr`, `sigaction`/`kill`/`raise`,
+`poll`) exists and type-checks against Android's headers. That's a real,
+useful signal (it rules out the API-doesn't-exist-on-this-platform failure
+mode entirely), but `cargo check` never links or runs anything, so it says
+nothing about runtime behavior — whether `TIOCSCTTY` actually grants a
+controlling terminal the way rustlogger's `pty_session.rs` assumes, whether
+raw-mode termios flags behave identically under Termux's environment, or
+whether Android's more aggressive app-lifecycle process management interferes
+with signal delivery the way it wouldn't on a desktop OS. None of that has
+been verified, because there's no Android device or emulator available in
+this dev environment to verify it on. See `docs/rustlogger-android-termux.md`
+for exactly what still needs checking, and why the right build path is
+on-device inside Termux (`pkg install rust`) rather than cross-compiling from
+desktop Linux with the Android NDK — Termux has its own prefix and expects
+binaries built against it specifically, and NDK cross-compilation is a known
+source of subtle mismatches for that reason, independent of the OS being
+technically the same Android/bionic base underneath.

@@ -70,3 +70,32 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       interactive mode so headless mode reuses both rather than
       duplicating them. 23/23 tests green (20 unit + 3 integration,
       `cargo test -p rustlogger`), stable across repeated runs.
+- [ ] 8. Cross-platform, part 1 - Android via Termux (see
+      `docs/rustlogger-android-termux.md`). `cargo check` confirmed clean
+      for both `aarch64-linux-android` and `armv7-linux-androideabi` with
+      no source changes - every `nix` API in use (pty/termios/signal/poll)
+      type-checks for Android. **Not yet done: an actual on-device
+      build+test run.** No Android device/emulator is available in this
+      dev environment, so `cargo test -p rustlogger` has not actually been
+      run and gone green on Android - don't check this box on the strength
+      of the type-check alone. Whoever has device access next should build
+      on-device via Termux's own toolchain (`pkg install rust`, not NDK
+      cross-compilation - see the doc for why) and confirm the real test
+      suite passes there, plus the specific runtime risks called out in
+      that doc (signal delivery under Android's process lifecycle
+      management, in particular).
+- [ ] 9. Cross-platform, part 2 - native Windows console. Scoped as its own
+      sub-project once chunk 8 is settled: rustlogger's pty/terminal/signal
+      layer (`pty_session.rs`, `terminal.rs`, `signals.rs`) is built
+      entirely on POSIX APIs via `nix` (`openpty`, `termios`, `sigaction`)
+      that have no Windows equivalent. Native Windows needs a parallel
+      backend using ConPTY (`CreatePseudoConsole`) instead of `openpty`,
+      the console-mode APIs instead of `termios`, and console-control-event
+      handlers instead of POSIX signals - not a port, a second
+      implementation selected by `cfg(windows)` vs `cfg(unix)`. Needs its
+      own design doc section (architecture per-platform, which pieces are
+      genuinely shared vs. which need two implementations) and almost
+      certainly a new crate for the Windows side (`windows` and/or a
+      ConPTY-wrapping crate) - subject to the crate-checklist process in
+      `docs/crate-checklist.md` before anything gets added to `Cargo.toml`.
+      Not started.
