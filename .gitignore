@@ -25,3 +25,5 @@ INDEX.md
 
 # rustlogger session logs (created wherever it's run - see rustlogger/docs)
 rustlogger-*.log
+
+**/*/spec
