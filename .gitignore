@@ -27,3 +27,18 @@ INDEX.md
 rustlogger-*.log
 
 **/*/spec
+Cargo.lock
+docs/TODO-rustlogger.md
+docs/crate-checklist.md
+docs/rustlogger-design.md
+rustlogger/Cargo.toml
+rustlogger/README.md
+rustlogger/src/pty_session/mod.rs
+rustlogger/src/pty_session/windows.rs
+rustlogger/src/session/mod.rs
+rustlogger/src/session/windows.rs
+rustlogger/src/signals/mod.rs
+rustlogger/src/signals/windows.rs
+rustlogger/src/terminal/mod.rs
+rustlogger/src/terminal/windows.rs
+rustlogger/tests/session_end_to_end.rs

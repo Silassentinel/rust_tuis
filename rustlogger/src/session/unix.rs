@@ -11,8 +11,13 @@
 //! via a single thread plus `poll()` instead of a reader/writer thread
 //! pair, since both directions are small, interactive byte streams rather
 //! than independent long-running transfers).
+//!
+//! `poll()` is POSIX-specific, which is why this whole module - not just
+//! the pty/termios/signal primitives it calls - is `cfg(unix)`-gated; see
+//! `session/windows.rs` for the equivalent using Windows-appropriate
+//! multiplexing, and `super::{StopReason, finish_session}` for what's
+//! actually shared between the two.
 
-use std::fmt;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::os::fd::AsFd;
@@ -20,9 +25,8 @@ use std::time::SystemTime;
 
 use nix::libc;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
 
+use super::{finish_session, StopReason};
 use crate::logfile::LogFile;
 use crate::pty_session::PtySession;
 use crate::signals;
@@ -31,36 +35,6 @@ use crate::terminal::RawGuard;
 use crate::timestamp::format_utc_compact;
 
 const BUF_SIZE: usize = 4096;
-
-/// Why the session loop stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    /// The user typed the `stoplogger` trigger phrase. Only reachable in
-    /// interactive mode (`run`) - headless mode (`run_headless`) has no
-    /// live outer keystroke stream to watch for it.
-    StopPhrase,
-    /// The wrapped shell or tracked command exited on its own (the pty's
-    /// master side hit EOF).
-    ChildExited,
-    /// The outer terminal's input closed from under us - not one of the
-    /// documented stop conditions, but reading 0 bytes forever in a loop
-    /// would spin, so it's treated as an implicit "session ends any other
-    /// way" case. Only reachable in interactive mode.
-    OuterClosed,
-    /// rustlogger itself received `SIGINT`/`SIGHUP`/`SIGTERM`.
-    Signal(Signal),
-}
-
-impl fmt::Display for StopReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StopReason::StopPhrase => write!(f, "stoplogger command"),
-            StopReason::ChildExited => write!(f, "process exited"),
-            StopReason::OuterClosed => write!(f, "outer terminal input closed"),
-            StopReason::Signal(sig) => write!(f, "caught signal {sig}"),
-        }
-    }
-}
 
 /// Reads from the pty master, treating both a clean 0-byte read and the
 /// `EIO`-at-EOF quirk (see the comment this used to carry inline - once
@@ -83,11 +57,12 @@ fn read_master(master: &mut File, buf: &mut [u8]) -> io::Result<Option<usize>> {
 /// fires. Generic over the outer terminal's reader/writer, rather than
 /// hardcoded to `Stdin`/`Stdout`, so tests can stand in a pipe pair for "the
 /// real terminal" without one actually attached to the test process - the
-/// same reasoning `pty_session.rs`'s tests use for the wrapped shell's side.
+/// same reasoning `pty_session/unix.rs`'s tests use for the wrapped shell's
+/// side.
 ///
 /// Note: the `Signal` stop reason is reached via `poll()` returning `EINTR`,
 /// which requires an actual signal to interrupt a blocked syscall. That's
-/// exercised manually and via `signals::tests` (which verifies the
+/// exercised manually and via `signals::unix::tests` (which verifies the
 /// record/clear mechanism directly); it isn't re-tested here with a real
 /// concurrently-delivered signal because `sigaction` state and the
 /// `signals` module's flag are process-global, and cargo runs test
@@ -118,8 +93,8 @@ where
             match poll(&mut fds, PollTimeout::NONE) {
                 Ok(_) => {}
                 Err(nix::Error::EINTR) => {
-                    if let Some(sig) = signals::received() {
-                        return Ok(StopReason::Signal(sig));
+                    if let Some(info) = signals::received() {
+                        return Ok(StopReason::Signal(info));
                     }
                     continue;
                 }
@@ -173,8 +148,8 @@ fn headless_loop<LW: Write>(
             match poll(&mut fds, PollTimeout::NONE) {
                 Ok(_) => {}
                 Err(nix::Error::EINTR) => {
-                    if let Some(sig) = signals::received() {
-                        return Ok(StopReason::Signal(sig));
+                    if let Some(info) = signals::received() {
+                        return Ok(StopReason::Signal(info));
                     }
                     continue;
                 }
@@ -198,7 +173,7 @@ fn headless_loop<LW: Write>(
 /// proxies until a stop condition fires, logs the whole thing, and
 /// returns the exit code rustlogger itself should exit with.
 pub fn run(shell: &str) -> io::Result<i32> {
-    signals::install().map_err(nix_err_to_io)?;
+    signals::install()?;
 
     let mut session = PtySession::spawn(shell)?;
     let mut trigger = StopTrigger::new();
@@ -247,7 +222,7 @@ pub fn run(shell: &str) -> io::Result<i32> {
 /// rustlogger itself is signaled to stop tracking (typically via
 /// `SIGTERM`, which is what the MCP server's "stop tracking" tool sends).
 pub fn run_headless(command: &str, args: &[String]) -> io::Result<i32> {
-    signals::install().map_err(nix_err_to_io)?;
+    signals::install()?;
 
     let mut cmd = std::process::Command::new(command);
     cmd.args(args);
@@ -270,52 +245,6 @@ pub fn run_headless(command: &str, args: &[String]) -> io::Result<i32> {
     let reason = headless_loop(&mut session, &mut log)?;
 
     finish_session(&mut session, &mut log, reason)
-}
-
-/// Shared tail end of both `run` and `run_headless`: reacts to the stop
-/// reason (killing the tracked process first if the session didn't end on
-/// its own), reaps it, writes the log's footer, and returns the exit code
-/// rustlogger itself should exit with.
-fn finish_session<LW: Write>(
-    session: &mut PtySession,
-    log: &mut LogFile<LW>,
-    reason: StopReason,
-) -> io::Result<i32> {
-    let (exit_code, child_code) = match reason {
-        StopReason::ChildExited => {
-            let code = session.wait()?;
-            (code.unwrap_or(1), code)
-        }
-        StopReason::StopPhrase => {
-            terminate_child(session)?;
-            (0, session.wait()?)
-        }
-        StopReason::OuterClosed => {
-            terminate_child(session)?;
-            (1, session.wait()?)
-        }
-        StopReason::Signal(sig) => {
-            terminate_child(session)?;
-            (128 + sig as i32, session.wait()?)
-        }
-    };
-
-    log.finish(&reason.to_string(), child_code, SystemTime::now())?;
-
-    Ok(exit_code)
-}
-
-/// Sends `SIGHUP` to the wrapped shell or tracked command - the same
-/// signal it would get from a real terminal hanging up - so ending the
-/// rustlogger session doesn't leave it running, detached from anything,
-/// connected to a pty nobody is proxying any more.
-fn terminate_child(session: &PtySession) -> io::Result<()> {
-    let pid = Pid::from_raw(session.child.id() as i32);
-    signal::kill(pid, Signal::SIGHUP).map_err(nix_err_to_io)
-}
-
-fn nix_err_to_io(e: nix::Error) -> io::Error {
-    io::Error::from_raw_os_error(e as i32)
 }
 
 #[cfg(test)]
@@ -351,7 +280,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::StopPhrase);
 
-        terminate_child(&session).expect("failed to send SIGHUP to child");
+        session.terminate().expect("failed to send SIGHUP to child");
         session.wait().expect("failed to reap child");
     }
 
@@ -409,7 +338,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::OuterClosed);
 
-        terminate_child(&session).expect("failed to send SIGHUP to child");
+        session.terminate().expect("failed to send SIGHUP to child");
         session.wait().expect("failed to reap child");
     }
 
@@ -421,13 +350,12 @@ mod tests {
             .expect("failed to spawn /bin/echo in a pty");
 
         let mut log = test_log();
-        let reason =
-            headless_loop(&mut session, &mut log).expect("headless_loop failed");
+        let reason = headless_loop(&mut session, &mut log).expect("headless_loop failed");
 
         assert_eq!(reason, StopReason::ChildExited);
 
-        let exit_code = finish_session(&mut session, &mut log, reason)
-            .expect("finish_session failed");
+        let exit_code =
+            finish_session(&mut session, &mut log, reason).expect("finish_session failed");
         assert_eq!(exit_code, 0);
 
         let logged = String::from_utf8(log.into_writer()).unwrap();
@@ -438,6 +366,48 @@ mod tests {
         assert!(
             logged.contains("reason: process exited"),
             "log: {logged:?}"
+        );
+    }
+
+    #[test]
+    fn finish_session_preserves_output_logged_before_it_was_called() {
+        // Regression guard for the refactor that split session.rs into
+        // session/mod.rs (finish_session) + session/unix.rs (the loops
+        // that call it): finish_session must append the footer after
+        // whatever was already written, not clobber or reorder it. Uses
+        // LogFile directly, rather than driving a real pty through
+        // proxy_loop, because two lines written back-to-back into a pipe
+        // can coalesce into a single read() - a real, pre-existing
+        // characteristic of proxy_loop's stoplogger detection (it returns
+        // the moment the trigger phrase is found in a chunk, without
+        // waiting for a prior command's output to round-trip back through
+        // master first), not something this refactor changed or something
+        // worth pinning down with a timing-dependent test here.
+        let mut session = PtySession::spawn("/bin/sh").expect("failed to spawn shell");
+        let mut log = test_log();
+        log.write_output(b"output from before the stop condition fired\n")
+            .expect("failed to write to log");
+
+        let exit_code = finish_session(&mut session, &mut log, StopReason::StopPhrase)
+            .expect("finish_session failed");
+        assert_eq!(exit_code, 0, "stoplogger should be a clean exit");
+
+        let logged = String::from_utf8(log.into_writer()).unwrap();
+        assert!(
+            logged.contains("output from before the stop condition fired"),
+            "expected prior log content to survive finish_session, got: {logged:?}"
+        );
+        assert!(
+            logged.contains("=== rustlogger session ended "),
+            "log: {logged:?}"
+        );
+        assert!(
+            logged.contains("reason: stoplogger command"),
+            "log: {logged:?}"
+        );
+        assert!(
+            logged.find("output from before").unwrap() < logged.find("session ended").unwrap(),
+            "prior output should appear before the footer, not after: {logged:?}"
         );
     }
 }

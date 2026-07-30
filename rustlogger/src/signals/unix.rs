@@ -16,10 +16,13 @@
 //! mutex/channel since only a single `store`/`load` is needed) and calls
 //! `received()` to find out which one.
 
+use std::io;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::libc;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+use super::StopSignal;
 
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
 
@@ -31,26 +34,36 @@ extern "C" fn record(signal: libc::c_int) {
 /// set `SA_RESTART`, so that a blocking `poll()` in the session loop is
 /// interrupted (returns `EINTR`) the moment one of these arrives, rather
 /// than transparently resuming as if nothing happened.
-pub fn install() -> nix::Result<()> {
+pub fn install() -> io::Result<()> {
     let action = SigAction::new(SigHandler::Handler(record), SaFlags::empty(), SigSet::empty());
     // SAFETY: `record` only performs an atomic store, which is
     // async-signal-safe; installing it as the handler for these three
     // signals is otherwise a plain `sigaction(2)` call.
     unsafe {
-        signal::sigaction(Signal::SIGINT, &action)?;
-        signal::sigaction(Signal::SIGHUP, &action)?;
-        signal::sigaction(Signal::SIGTERM, &action)?;
+        signal::sigaction(Signal::SIGINT, &action).map_err(nix_err_to_io)?;
+        signal::sigaction(Signal::SIGHUP, &action).map_err(nix_err_to_io)?;
+        signal::sigaction(Signal::SIGTERM, &action).map_err(nix_err_to_io)?;
     }
     Ok(())
 }
 
 /// Returns (and clears) the most recently received signal, if any of
-/// `SIGINT`/`SIGHUP`/`SIGTERM` has arrived since the last call.
-pub fn received() -> Option<Signal> {
+/// `SIGINT`/`SIGHUP`/`SIGTERM` has arrived since the last call, described
+/// platform-agnostically - `session.rs` never sees a raw `nix::sys::signal::Signal`.
+/// The `128+n` exit-code convention is computed here, not in `session.rs`,
+/// since it's a POSIX/shell convention specifically, not a generic one.
+pub fn received() -> Option<StopSignal> {
     match RECEIVED.swap(0, Ordering::SeqCst) {
         0 => None,
-        raw => Signal::try_from(raw).ok(),
+        raw => Signal::try_from(raw).ok().map(|sig| StopSignal {
+            description: sig.to_string(),
+            exit_code: 128 + sig as i32,
+        }),
     }
+}
+
+fn nix_err_to_io(e: nix::Error) -> io::Error {
+    io::Error::from_raw_os_error(e as i32)
 }
 
 #[cfg(test)]
@@ -67,13 +80,31 @@ mod tests {
         assert_eq!(received(), None);
 
         signal::raise(Signal::SIGTERM).expect("failed to raise SIGTERM");
-        assert_eq!(received(), Some(Signal::SIGTERM));
+        assert_eq!(
+            received(),
+            Some(StopSignal {
+                description: "SIGTERM".to_string(),
+                exit_code: 143
+            })
+        );
         assert_eq!(received(), None, "received() should clear the flag");
 
         signal::raise(Signal::SIGHUP).expect("failed to raise SIGHUP");
-        assert_eq!(received(), Some(Signal::SIGHUP));
+        assert_eq!(
+            received(),
+            Some(StopSignal {
+                description: "SIGHUP".to_string(),
+                exit_code: 129
+            })
+        );
 
         signal::raise(Signal::SIGINT).expect("failed to raise SIGINT");
-        assert_eq!(received(), Some(Signal::SIGINT));
+        assert_eq!(
+            received(),
+            Some(StopSignal {
+                description: "SIGINT".to_string(),
+                exit_code: 130
+            })
+        );
     }
 }

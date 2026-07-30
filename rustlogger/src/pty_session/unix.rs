@@ -102,6 +102,22 @@ impl PtySession {
         let status = self.child.wait()?;
         Ok(status.code())
     }
+
+    /// Asks the wrapped shell/command to gracefully stop, the same way
+    /// `session.rs` needs to whenever a session ends for a reason other
+    /// than the child exiting on its own (the `stoplogger` phrase, the
+    /// outer terminal closing, or rustlogger itself being signaled) -
+    /// sends `SIGHUP`, the same signal a real terminal hanging up would
+    /// send, so nothing is left running detached from anything. This
+    /// method exists on `PtySession` (rather than as a free function
+    /// taking a pid, as it used to be in `session.rs`) specifically so
+    /// `session.rs` doesn't need to know *how* a platform asks a process
+    /// to stop - `pty_session/windows.rs` implements the same method
+    /// name with Windows' own equivalent mechanism.
+    pub fn terminate(&self) -> io::Result<()> {
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP).map_err(nix_err_to_io)
+    }
 }
 
 /// `nix::Error` (an `Errno`) shares its discriminant values with the C
@@ -144,5 +160,50 @@ mod tests {
             text.contains("hello-from-pty"),
             "expected pty output to contain the echoed text, got: {text:?}"
         );
+    }
+
+    #[test]
+    fn terminate_stops_a_still_running_child() {
+        let mut session = PtySession::spawn("/bin/sh").expect("failed to spawn shell in pty");
+
+        session.terminate().expect("failed to terminate the child");
+
+        let code = session.wait().expect("failed to wait on child");
+        assert_eq!(
+            code, None,
+            "expected the shell to be killed by SIGHUP (no exit code), got: {code:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_command_carries_extra_args_and_env() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("echo \"$GREETING\" \"$1\"").arg("--").arg("world");
+        command.env("GREETING", "hello");
+        let mut session =
+            PtySession::spawn_command(command).expect("failed to spawn /bin/sh with args/env");
+
+        let mut output = Vec::new();
+        let _ = session.master.read_to_end(&mut output);
+        let code = session.wait().expect("failed to wait on child");
+        assert_eq!(code, Some(0));
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("hello world"),
+            "expected args and env to reach the spawned command, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tty_path_looks_like_a_real_pty_device() {
+        let mut session = PtySession::spawn("/bin/sh").expect("failed to spawn shell in pty");
+        assert!(
+            session.tty.starts_with("/dev/"),
+            "expected a real device path, got: {:?}",
+            session.tty
+        );
+        session.terminate().expect("failed to terminate the child");
+        let _ = session.wait();
     }
 }
