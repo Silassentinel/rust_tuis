@@ -113,3 +113,4 @@ wasm_core_engine/docs/TODO.md
 wasm_core_engine/docs/architecture.md
 wasm_core_engine/docs/crate-checklist.md
 rustmon/examples/preview.rs
+rustmon/tests/integration.rs
