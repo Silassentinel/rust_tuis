@@ -114,3 +114,5 @@ wasm_core_engine/docs/architecture.md
 wasm_core_engine/docs/crate-checklist.md
 rustmon/examples/preview.rs
 rustmon/tests/integration.rs
+rustmon/man/rustmon.1
+rustmon/src/summary.rs
