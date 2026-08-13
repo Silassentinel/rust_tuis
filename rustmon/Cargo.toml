@@ -1,0 +1,53 @@
+[package]
+name = "rustmon"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only Linux hardware monitor: TUI + one-shot JSON/text snapshot"
+license = "MIT"
+
+[features]
+# `tui` and `fs-capacity` are both default so a plain `cargo build`/`cargo run`
+# gives the live UI and real mount capacity numbers, but the crate MUST stay
+# buildable and useful with `--no-default-features` (that build has zero
+# external dependencies and still provides `rustmon --once`, just without
+# per-mount capacity). See docs/rustmon-design.md, "Feature gating".
+default = ["tui", "fs-capacity"]
+
+# Live terminal UI. Approved 2026-08-12, proposal "rustmon B" in
+# docs/crate-checklist.md — pulls in the optional `ratatui`/`crossterm`
+# dependencies below. `ratatui/crossterm_0_29` is the specific backend
+# feature that pins ratatui's internal crossterm integration to the same
+# 0.29 line as our own `crossterm` dependency, rather than pulling in
+# ratatui's default widget/backend set (calendar widget, macros, etc.) that
+# this crate doesn't use.
+tui = ["dep:ratatui", "dep:crossterm", "ratatui/crossterm_0_29"]
+
+# NVIDIA GPU metrics via NVML. Deliberately NOT in `default`: NVML is a dlopen
+# of a proprietary vendor library into our address space, which is a different
+# trust decision from reading text files. Proposal "rustmon C" — declined, no
+# NVIDIA hardware to target.
+gpu-nvidia = []
+
+# Per-mount filesystem capacity via statvfs(3). Approved 2026-08-12, proposal
+# "rustmon A" in docs/crate-checklist.md — pulls in the optional `nix`
+# dependency below (`fs` feature only).
+fs-capacity = ["dep:nix"]
+
+[dependencies]
+crossterm = { version = "0.29.0", optional = true }
+ratatui = { version = "0.30.2", default-features = false, optional = true }
+# Approved 2026-08-12, see docs/crate-checklist.md ("rustmon A"). `nix` is
+# already in the tree for `rustlogger` (same 0.31 line) — this adds no new
+# transitive dependencies, just the `fs` feature (`statvfs`) for the
+# `fs-capacity` feature above. POSIX-only, so cfg(unix)-gated like
+# rustlogger's own usage.
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31", features = ["fs"], optional = true }
+
+[lib]
+name = "rustmon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustmon"
+path = "src/main.rs"

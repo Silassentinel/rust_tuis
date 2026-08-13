@@ -1,0 +1,225 @@
+.TH RUSTMON 1 "2026-08-12" "rustmon 0.1.0" "User Commands"
+.SH NAME
+rustmon \- read\-only Linux hardware monitor: live TUI or one\-shot text/JSON snapshot
+.SH SYNOPSIS
+.B rustmon
+.br
+.B rustmon \-\-once
+.RI [ OPTIONS ]
+.br
+.B rustmon \-\-summary
+.SH DESCRIPTION
+With no arguments,
+.B rustmon
+opens a live, full\-screen terminal UI showing CPU, memory, temperature,
+fan, disk, network, and GPU state, refreshed on an interval (see
+.B KEY BINDINGS
+below).
+.PP
+.B \-\-once
+takes a single reading instead, prints it as aligned text or JSON, and
+exits \(em no interactive loop, no rate/throughput figures (those need two
+readings, which would make a supposedly one\-shot command block for an
+interval), suitable for scripts and cron.
+.PP
+.B \-\-summary
+prints at most one short line and exits, intended to run before every
+shell prompt \(em see
+.B SUMMARY MODE
+below.
+.PP
+.B rustmon
+is read\-only by design: it never writes to
+.IR /proc " or " /sys ,
+never spawns a subprocess, and never requires root. Anything it can't
+read is reported as absent rather than as an error.
+.SH OPTIONS
+.TP
+\fB\-1\fR, \fB\-\-once\fR
+One snapshot to stdout, then exit (no TUI).
+.TP
+\fB\-\-summary\fR
+Shell\-prompt one\-liner, then exit. See
+.BR "SUMMARY MODE" .
+Mutually exclusive with
+.BR \-\-once ;
+if both are given, the last one wins.
+.TP
+\fB\-f\fR, \fB\-\-format\fR \fIFORMAT\fR
+Output format for
+.BR \-\-once :
+.I text
+(default) or
+.IR json .
+The JSON schema is documented in the project's README.
+.TP
+\fB\-i\fR, \fB\-\-interval\fR \fITIME\fR
+Refresh interval: a bare number of milliseconds, or a value like
+.IR 500ms " or " 2s
+(default: 1s, floor: 100ms).
+.TP
+\fB\-\-only\fR \fILIST\fR
+Run only these collectors, comma\-separated (e.g.
+.IR cpu,memory ).
+.TP
+\fB\-\-skip\fR \fILIST\fR
+Never run these collectors, comma\-separated; applied after
+.BR \-\-only .
+.TP
+\fB\-\-sysfs\-root\fR \fIPATH\fR
+Root for all filesystem reads (default:
+.IR / ).
+.TP
+\fB\-\-history\fR \fIN\fR
+Samples retained for sparklines (default: 120, ceiling: 3600). Only
+matters for the live TUI.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Include the collector error list in output.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print usage and exit.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print the version and compiled\-in features, then exit.
+.SH KEY BINDINGS
+These apply to the live TUI only (no effect under
+.BR \-\-once " or " \-\-summary ).
+.TP
+.B q, Esc, Ctrl\-C
+Quit.
+.TP
+.B Tab, Shift\-Tab
+Cycle panel focus.
+.TP
+.B 1\-6
+Jump directly to a panel (CPU, memory, thermal, disk, net, GPU).
+.TP
+.B space
+Pause/resume the refresh loop.
+.TP
+.B r
+Reset the rate tracker \(em the next refresh drops its interval rather
+than averaging across the pause.
+.TP
+.B ?
+Toggle the help overlay.
+.TP
+\fB+\fR, \fB\-\fR
+Adjust the refresh interval (floor: 100ms).
+.SH SUMMARY MODE
+.B rustmon \-\-summary
+is built for a shell prompt (e.g. an oh\-my\-posh command segment): it must
+run well under 100ms, so it deliberately collects only
+.IR cpu ", " memory ", and " thermal
+\(em the three collectors in this crate with no exposure to a slow read (no
+.BR statvfs (2)
+call, no
+.I /proc
+process\-table walk) \(em regardless of any
+.B \-\-only
+or
+.B \-\-skip
+also given.
+.PP
+If there is nothing worth surfacing (no sensor at warning/critical
+severity, no collector error), it prints
+.B nothing
+and exits
+.BR 1 .
+Otherwise it prints one compact JSON object to stdout and exits
+.BR 0 :
+.PP
+.RS
+.nf
+{"status": "warning", "headline": "2 warnings"}
+.fi
+.RE
+.PP
+.I status
+is one of
+.IR ok ", " warning ", or " critical .
+.I headline
+is short enough to sit in a colored prompt segment next to a git branch,
+not a paragraph. A shell prompt integration that hides its segment on a
+nonzero exit code or empty output (oh\-my\-posh's command segment does
+this out of the box) needs no other configuration to appear only when
+there's something to say.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit \(em the TUI was quit,
+.B \-\-once
+completed successfully, or
+.B \-\-summary
+had something to report.
+.TP
+.B 1
+A configuration error (an unknown flag, a missing flag value, an invalid
+.BR \-\-sysfs\-root ,
+or an unknown collector name in
+.BR \-\-only " / " \-\-skip ),
+or \(em under
+.B \-\-summary
+specifically \(em a deliberate signal that there is nothing worth
+surfacing this run, not a failure.
+.SH OUTPUT
+.B \-\-once \-\-format json
+emits one JSON object per invocation: a fixed
+.I schema
+version, a UTC timestamp, and one section per collector that produced
+data (a machine with no GPU has no
+.I gpu
+key at all, not an empty one). Every string is escaped per RFC 8259 and
+sanitised of control characters/ANSI sequences before it reaches the
+output. Full field\-by\-field documentation: the project's README.
+.SH EXAMPLES
+.TP
+Start the live TUI:
+.B rustmon
+.TP
+One snapshot as aligned text:
+.B rustmon \-\-once
+.TP
+One snapshot as JSON, piped to a tool that wants it:
+.B rustmon \-\-once \-\-format json | jq .
+.TP
+Just CPU and memory, refreshed every 2 seconds:
+.B rustmon \-\-only cpu,memory \-\-interval 2s
+.TP
+Point at a fixture tree instead of the real machine:
+.B rustmon \-\-once \-\-sysfs\-root /path/to/fixture
+.TP
+Shell\-prompt one\-liner:
+.B rustmon \-\-summary
+.SH LIMITATIONS
+.IP \(bu 2
+Linux only.
+.IP \(bu 2
+.B \-\-once
+never takes two readings to compute a rate \(em throughput and CPU busy%
+exist only in the live TUI.
+.IP \(bu 2
+.B \-\-summary
+only ever looks at CPU, memory, and thermal state \(em disk, net, and GPU
+are never part of its headline, by design (see
+.BR "SUMMARY MODE" ).
+.IP \(bu 2
+NVIDIA GPU metrics are not supported (no NVIDIA hardware to target;
+AMD/Intel GPU support is unaffected).
+.IP \(bu 2
+A handful of hwmon sensors (some power/voltage sensors on server\-class
+boards) are root\-only under some kernel configurations. Unprivileged is
+still the recommended way to run
+.BR rustmon ;
+that one sensor is reported as absent rather than as an error, and every
+other sensor on the same chip is unaffected.
+.SH SEE ALSO
+.BR top (1),
+.BR free (1),
+.BR sensors (1),
+.BR ss (1),
+.BR df (1)
+.SH AUTHOR
+See the project repository for source, design notes, and the build log:
+.I https://github.com/Silassentinel/rust_tuis

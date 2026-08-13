@@ -1,0 +1,29 @@
+[package]
+name = "rustlogger"
+version = "0.1.0"
+edition = "2021"
+description = "Wraps the shell in the terminal it's launched from and logs the whole session to a file until stopped."
+
+[dependencies]
+
+# Approved 2026-07-23, see docs/crate-checklist.md ("rustlogger: pseudo-terminal
+# (pty) handling") for the why/what/how. "term" (pty + termios) landed in
+# chunk 3. "process"/"signal"/"poll" approved 2026-07-23 for chunk 4 (see
+# the follow-up entry in crate-checklist.md): process for waitpid/WaitStatus
+# (exit code vs killing signal), signal for SIGINT/SIGHUP/SIGTERM handlers,
+# poll for multiplexing the outer-stdin / pty-master proxy loop. `nix` is
+# a POSIX bindings crate with no Windows support at all, so it's gated to
+# cfg(unix) here (chunk 9) rather than a plain [dependencies] entry.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["term", "process", "signal", "poll"] }
+
+# Approved 2026-07-23, see docs/crate-checklist.md ("rustlogger: native Windows
+# pty/console handling (chunk 9)"). Both target-gated to cfg(windows) only -
+# zero effect on the existing Linux/Android nix-based implementation above.
+[target.'cfg(windows)'.dependencies]
+# ConPTY-backed pty spawning (CreatePseudoConsole's attribute-list/handle-lifetime
+# setup wrapped for us, the same reasoning nix's openpty spared on Unix).
+portable-pty = "0.9"
+# SetConsoleMode (raw-mode-equivalent) and SetConsoleCtrlHandler
+# (signal-equivalent) - only the two Win32 namespaces those calls live in.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console"] }

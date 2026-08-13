@@ -1,0 +1,279 @@
+.TH RUSTLOGGER 1 "2026-07-23" "rustlogger 0.1.0" "User Commands"
+.SH NAME
+rustlogger \- wrap the current shell in a pseudo\-terminal and log the whole session to a file
+.SH SYNOPSIS
+.B rustlogger
+.RI [ "\-\-log\-dir " dir ]
+.br
+.B rustlogger
+.RI [ "\-\-log\-dir " dir ]
+.I command
+.RI [ arg " ...]"
+.SH DESCRIPTION
+With no arguments,
+.B rustlogger
+runs your shell attached to a real pseudo\-terminal (pty), exactly the way
+.BR script (1)
+does, so interactive programs, colors, job control, and
+.B sudo
+prompts all behave normally. Everything that appears on screen \(em commands
+as they're echoed back and all their output \(em is written to a per\-session
+log file at the same time, until the session is stopped. It reads the
+.B SHELL
+environment variable to decide what to run (falling back to
+.I /bin/sh
+if unset).
+.PP
+Given a
+.I command
+(and optionally its arguments), rustlogger instead tracks that one command
+headlessly \(em see
+.B HEADLESS TRACKING MODE
+below.
+.PP
+Either way, the log by default lands in the directory rustlogger was launched
+from; pass
+.B \-\-log\-dir
+(or set
+.BR RUSTLOGGER_LOG_DIR )
+to put it somewhere else instead \(em see
+.B OPTIONS
+below.
+.SH OPTIONS
+.TP
+.BI \-\-log\-dir\  dir
+Write the log file into
+.I dir
+instead of the current directory,
+creating it (and any missing parent directories) if it doesn't already
+exist. Must be given before
+.IR command ,
+if any \(em anything from
+.I command
+onward belongs to the tracked command's own arguments and is never
+reinterpreted, so
+.B rustlogger \-\-log\-dir /x mycmd \-\-log\-dir /y
+passes the second
+.B \-\-log\-dir
+through to
+.B mycmd
+untouched. If both
+.B \-\-log\-dir
+and
+.B RUSTLOGGER_LOG_DIR
+are set, this flag wins.
+.SH ENVIRONMENT
+.TP
+.B SHELL
+The shell to run in interactive mode (no
+.IR command "),"
+falling back to
+.I /bin/sh
+if unset. Ignored in headless tracking mode.
+.TP
+.B RUSTLOGGER_LOG_DIR
+Default log directory, used when
+.B \-\-log\-dir
+isn't given. See
+.B OPTIONS
+above.
+.SH STOP CONDITIONS
+These apply to the no\-argument, interactive form. Headless tracking mode
+(see below) only ever stops via
+.B the wrapped shell exits
+(there, the tracked command) or
+.BR "a caught signal" .
+.PP
+A session ends, and the log file is closed, when any of the following happens:
+.TP
+.B the wrapped shell exits
+Any exit code (e.g. typing
+.B exit
+or pressing Ctrl+D).
+.B rustlogger
+itself then exits with that same code.
+.TP
+.B the trigger phrase
+Typing
+.B stoplogger
+alone on a line ends the session even if the shell keeps running \(em the
+wrapped shell is sent
+.B SIGHUP
+first, so it isn't left running detached from anything.
+.TP
+.B a caught signal
+.BR SIGINT " (Ctrl+C), " SIGHUP " (the terminal closing), or " SIGTERM
+(being killed) delivered to
+.B rustlogger
+itself all end the session cleanly: the outer terminal's mode is restored,
+the wrapped shell is sent
+.BR SIGHUP ,
+and the log file's footer records which signal it was.
+.SH LOG FILE
+The log is named
+.IR rustlogger\-YYYYMMDD\-HHMMSS.log ,
+timestamped (UTC) at session start, and written to the directory
+.B rustlogger
+was launched from, unless
+.B \-\-log\-dir
+or
+.B RUSTLOGGER_LOG_DIR
+says otherwise (see
+.BR OPTIONS ).
+.B rustlogger
+prints the full resolved path (directory included) to stderr when the
+session starts. A log looks like:
+.PP
+.RS
+.nf
+=== rustlogger session started 2026\-07\-23T14:32:07Z ===
+shell: /bin/bash
+tty: /dev/pts/4
+[2026\-07\-23T14:32:09Z] $ echo hello
+[2026\-07\-23T14:32:09Z] hello
+[2026\-07\-23T14:32:12Z] $ exit
+=== rustlogger session ended 2026\-07\-23T14:32:12Z ===
+reason: process exited
+exit code: 0
+.fi
+.RE
+.PP
+Only what actually appeared on screen is logged, not raw keystrokes. A prompt
+that turns terminal echo off for the duration of a sensitive input \(em most
+commonly
+.B sudo
+asking for a password \(em is therefore never captured, since nothing was
+ever echoed to log. This is deliberate, not a limitation.
+.PP
+Everything else on screen
+.I is
+captured verbatim, so a log should be treated as sensitive: it contains any
+secret that was printed, pasted or echoed during the session. Log files are
+created mode
+.BR 0600 ,
+and any directory
+.B rustlogger
+creates for them mode
+.BR 0700 ,
+so other local accounts cannot read them.
+.SH READING A LOG SAFELY
+The transcript is stored byte\-for\-byte, terminal escape sequences included,
+so that it is an honest record of what actually crossed the terminal. That
+makes a log untrusted content: rendering it re\-executes whatever the logged
+programs printed, which can rewrite the window title, clear the screen, write
+to the clipboard (OSC 52), use carriage returns so the displayed text differs
+from the bytes on disk, or forge lines identical to
+.BR rustlogger 's
+own
+.RB \(lq "=== rustlogger session ended \(em ===" \(rq
+footer.
+.PP
+Prefer
+.B cat \-v
+or a plain
+.BR less ,
+both of which render control characters as visible text:
+.PP
+.RS
+.nf
+cat \-v rustlogger\-*.log
+.fi
+.RE
+.PP
+Avoid a bare
+.B cat
+or
+.BR "less \-R" ,
+which pass the escape sequences through to your terminal. This matters most
+when reviewing a transcript of something you did not run yourself \(em a CI
+job, a build script, or anything started by another person or an agent.
+.SH HEADLESS TRACKING MODE
+.B rustlogger
+.I command
+.RI [ arg " ...]"
+runs
+.I command
+(with its arguments) attached to a pty, the same as interactive mode, but
+touches no outer terminal at all: no raw terminal mode, and no
+.B stoplogger
+phrase detection, since there's no live keystroke stream to watch for it.
+Output is logged exactly as in interactive mode and also mirrored to
+.BR rustlogger 's
+own stdout. The session ends when
+.I command
+exits on its own, or when
+.B rustlogger
+itself is sent
+.BR SIGINT ", " SIGHUP ", or " SIGTERM
+(the tracked command is sent
+.B SIGHUP
+first, so it isn't left running).
+.PP
+This mode exists for driving
+.B rustlogger
+from something other than a live terminal \(em see the
+.B rustlogger\-mcp\-server
+project alongside this one, which lets Claude start a tracked command in the
+background, check its log later, and stop it.
+.SH EXIT STATUS
+.TP
+.B the wrapped shell's (or tracked command's) own exit code
+When the session ends because it exited on its own.
+.TP
+.B 0
+When the session ends via the
+.B stoplogger
+trigger phrase.
+.TP
+.B 128+n
+When
+.B rustlogger
+itself is stopped by signal
+.IR n ,
+following the usual shell convention (e.g. 130 for
+.BR SIGINT ).
+.TP
+.B 1
+On an unexpected I/O error, or if the outer terminal's input closes out from
+under the session.
+.SH EXAMPLES
+.TP
+Start a logged interactive session with your normal shell:
+.B rustlogger
+.TP
+Start a logged interactive session with a specific shell:
+.B SHELL=/bin/bash rustlogger
+.TP
+Track a build in the background and log it, headlessly:
+.B rustlogger npm run build
+.TP
+Track a build, keeping logs out of the repo's own working directory:
+.B rustlogger \-\-log\-dir ~/.rustlogger/logs npm run build
+.SH LIMITATIONS
+.IP \(bu 2
+Linux only.
+.IP \(bu 2
+Not a replacement for full asciinema\-style timing/playback \(em this is a
+plain\-text transcript, not a recorded\-and\-replayable format.
+.IP \(bu 2
+The log's filename itself isn't configurable, only its directory \(em always
+named after the UTC start time.
+.IP \(bu 2
+The
+.B stoplogger
+trigger is matched against everything typed, with no way to tell which
+program is actually consuming it. Typing or pasting
+.B stoplogger
+alone on a line into an editor, a pager, a heredoc or an interactive database
+client ends the session too.
+.IP \(bu 2
+No terminal window\-resize
+.RB ( SIGWINCH )
+propagation to the wrapped shell yet.
+.SH SEE ALSO
+.BR script (1),
+.BR bash (1),
+.BR sh (1)
+.SH AUTHOR
+See the project repository for source, design notes, and the build log:
+.I https://github.com/Silassentinel/rust_tuis
