@@ -142,7 +142,18 @@ rustmon --help                                 # every flag, documented
 ```
 
 Full reference, including every flag and TUI keybinding: `man ./man/rustmon.1`
-(or install it into your `MANPATH` to just run `man rustmon`).
+straight from the repo, or install it once so plain `man rustmon` finds it
+too — `cargo install` only installs the binary, not the man page, so this
+is a separate step:
+
+```sh
+mkdir -p ~/.local/share/man/man1
+cp man/rustmon.1 ~/.local/share/man/man1/rustmon.1
+mandb --user-db   # rebuilds the index so `man` picks it up immediately
+```
+
+(`~/.local/share/man` is on most distros' default `MANPATH` already; if
+`man rustmon` still can't find it, add that directory to `MANPATH` yourself.)
 
 `--only`/`--skip` names must be one of `cpu`, `memory`, `thermal`, `disk`,
 `net`, `gpu`, `connections` — a typo (`--only cpuu`) is a hard error, not a
