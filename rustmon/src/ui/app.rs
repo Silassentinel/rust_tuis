@@ -139,14 +139,27 @@ pub enum EnrichState<T> {
 #[derive(Debug, Clone, Default)]
 pub struct Enrichment {
     pub domains: EnrichState<Vec<String>>,
+    /// Route to this IP, one entry per hop (`None` = a silent hop — no
+    /// reply within its timeout, shown as `*`). IPv4 only — see
+    /// `net_probe::traceroute`'s own module doc for why — so this stays
+    /// `NotRequested` forever for an IPv6 remote address; `resolve_checked`
+    /// never even attempts to populate it in that case. Behind its own
+    /// feature (separate from `tui`) since `traceroute` is a distinct
+    /// crate-checklist-gated capability — `tui` without `traceroute` must
+    /// stay a valid, useful build (DNS resolution alone, no route tracing).
+    #[cfg(feature = "traceroute")]
+    pub route: EnrichState<Vec<crate::net_probe::traceroute::Hop>>,
 }
 
 /// A background lookup's result, reported back over [`App`]'s enrichment
-/// channel. `None` inside `Domains` means the lookup completed but found
-/// nothing (or failed) — see [`crate::net_probe::dns::resolve_ptr`]'s own
-/// doc for the exact distinction it draws.
+/// channel. `None` inside `Domains`/`Route` means the lookup completed but
+/// found nothing (or failed) — see [`crate::net_probe::dns::resolve_ptr`]'s
+/// and [`crate::net_probe::traceroute::trace`]'s own docs for the exact
+/// distinction each draws.
 enum EnrichmentUpdate {
     Domains(IpAddr, Option<Vec<String>>),
+    #[cfg(feature = "traceroute")]
+    Route(IpAddr, Option<Vec<crate::net_probe::traceroute::Hop>>),
 }
 
 /// Everything the UI needs between frames.
@@ -384,7 +397,37 @@ impl App {
                 let result = crate::net_probe::dns::resolve_ptr(&reader, addr);
                 let _ = tx.send(EnrichmentUpdate::Domains(addr, result));
             });
+
+            #[cfg(feature = "traceroute")]
+            self.spawn_trace(addr);
         }
+    }
+
+    /// Kick off a traceroute for `addr` on its own background thread —
+    /// IPv4 only (see [`Enrichment::route`]'s own doc), and only if one
+    /// isn't already in flight or done for this IP. Split out from
+    /// [`Self::resolve_checked`] so the `#[cfg(feature = "traceroute")]`
+    /// gate stays in one place rather than wrapping half of that method's
+    /// body.
+    #[cfg(feature = "traceroute")]
+    fn spawn_trace(&mut self, addr: IpAddr) {
+        let IpAddr::V4(v4) = addr else { return };
+
+        let in_flight_or_done = matches!(
+            self.enrichment.get(&addr).map(|e| &e.route),
+            Some(EnrichState::Pending) | Some(EnrichState::Done(_))
+        );
+        if in_flight_or_done {
+            return;
+        }
+
+        self.enrichment.entry(addr).or_default().route = EnrichState::Pending;
+
+        let tx = self.enrichment_tx.clone();
+        thread::spawn(move || {
+            let result = crate::net_probe::traceroute::trace(v4);
+            let _ = tx.send(EnrichmentUpdate::Route(addr, result));
+        });
     }
 
     /// Fold in any enrichment results that have arrived since the last
@@ -397,6 +440,14 @@ impl App {
                     let entry = self.enrichment.entry(addr).or_default();
                     entry.domains = match result {
                         Some(domains) => EnrichState::Done(domains),
+                        None => EnrichState::Failed,
+                    };
+                }
+                #[cfg(feature = "traceroute")]
+                EnrichmentUpdate::Route(addr, result) => {
+                    let entry = self.enrichment.entry(addr).or_default();
+                    entry.route = match result {
+                        Some(hops) => EnrichState::Done(hops),
                         None => EnrichState::Failed,
                     };
                 }

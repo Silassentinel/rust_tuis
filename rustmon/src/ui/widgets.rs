@@ -459,8 +459,13 @@ pub fn draw_connections(
                 Some(EnrichState::Failed) => "failed".to_string(),
             };
 
+            #[cfg(feature = "traceroute")]
+            let route = format!("  route: {}", route_text(enrichment.get(&c.remote_addr)));
+            #[cfg(not(feature = "traceroute"))]
+            let route = String::new();
+
             let line = format!(
-                "{checkbox} {:<20} {protocol} {}:{} -> {}:{}  {domain}",
+                "{checkbox} {:<20} {protocol} {}:{} -> {}:{}  {domain}{route}",
                 owner, c.local_addr, c.local_port, c.remote_addr, c.remote_port
             );
 
@@ -474,6 +479,26 @@ pub fn draw_connections(
         .collect();
 
     frame.render_widget(List::new(items), inner);
+}
+
+/// Render one connection's route state — `—` (never requested), `tracing…`
+/// (pending), `a -> b -> c` with `*` for a silent hop (done), or
+/// `unavailable` (failed — either a timeout, or no `CAP_NET_RAW`; the UI
+/// deliberately doesn't distinguish those two, since both mean the same
+/// thing to the user: no route this time).
+#[cfg(feature = "traceroute")]
+fn route_text(enrichment: Option<&Enrichment>) -> String {
+    match enrichment.map(|e| &e.route) {
+        None | Some(EnrichState::NotRequested) => "—".to_string(),
+        Some(EnrichState::Pending) => "tracing…".to_string(),
+        Some(EnrichState::Done(hops)) if hops.is_empty() => "no hops recorded".to_string(),
+        Some(EnrichState::Done(hops)) => hops
+            .iter()
+            .map(|h| h.map(|a| a.to_string()).unwrap_or_else(|| "*".to_string()))
+            .collect::<Vec<_>>()
+            .join(" -> "),
+        Some(EnrichState::Failed) => "unavailable".to_string(),
+    }
 }
 
 const HELP_HINT: &str = "q quit  Tab next  1-7 jump  space pause  r reset  ? help  +/- interval";
@@ -524,7 +549,7 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         "In the Connections panel:",
         "Up / Down      move the row cursor",
         "x              toggle the cursor row's checkbox",
-        "Enter          resolve every checked row's domain",
+        "Enter          resolve every checked row's domain + route",
     ]
     .join("\n");
     frame.render_widget(Paragraph::new(text), inner);
@@ -897,7 +922,13 @@ mod tests {
             (EnrichState::Failed, "failed"),
         ] {
             let mut enrichment = HashMap::new();
-            enrichment.insert(addr, Enrichment { domains: state });
+            // `..Default::default()` is needed to cover `Enrichment::route`
+            // when the `traceroute` feature is on, but redundant when it's
+            // off (that field doesn't exist then) — clippy is only right
+            // about one of the two configurations this crate builds under.
+            #[allow(clippy::needless_update)]
+            let enrichment_entry = Enrichment { domains: state, ..Default::default() };
+            enrichment.insert(addr, enrichment_entry);
             let text = render_to_text(80, 10, |frame| {
                 draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &enrichment);
             });
@@ -915,6 +946,36 @@ mod tests {
             draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
         });
         assert!(text.contains('—'), "expected an em-dash for unresolved domain: {text}");
+    }
+
+    #[cfg(feature = "traceroute")]
+    #[test]
+    fn connections_panel_shows_route_resolution_states() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample {
+            connections: vec![fake_connection(443)],
+        });
+        let addr: IpAddr = "8.8.8.8".parse().unwrap();
+
+        for (state, expected) in [
+            (EnrichState::Pending, "tracing"),
+            (
+                EnrichState::Done(vec![
+                    Some("10.0.0.1".parse().unwrap()),
+                    None,
+                    Some("8.8.8.8".parse().unwrap()),
+                ]),
+                "10.0.0.1 -> * -> 8.8.8.8",
+            ),
+            (EnrichState::Failed, "unavailable"),
+        ] {
+            let mut enrichment = HashMap::new();
+            enrichment.insert(addr, Enrichment { route: state, ..Default::default() });
+            let text = render_to_text(100, 10, |frame| {
+                draw_connections(frame, full_area(100, 10), &snapshot, 0, &HashSet::new(), &enrichment);
+            });
+            assert!(text.contains(expected), "expected {expected:?} in {text}");
+        }
     }
 
     // ---- draw_footer ------------------------------------------------------------

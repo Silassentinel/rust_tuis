@@ -18,3 +18,6 @@
 //! failure here must never be louder than "this one field stays absent."
 
 pub mod dns;
+
+#[cfg(feature = "traceroute")]
+pub mod traceroute;

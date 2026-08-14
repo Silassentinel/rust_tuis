@@ -11,7 +11,7 @@ license = "MIT"
 # buildable and useful with `--no-default-features` (that build has zero
 # external dependencies and still provides `rustmon --once`, just without
 # per-mount capacity). See docs/rustmon-design.md, "Feature gating".
-default = ["tui", "fs-capacity"]
+default = ["tui", "fs-capacity", "traceroute"]
 
 # Live terminal UI. Approved 2026-08-12, proposal "rustmon B" in
 # docs/crate-checklist.md — pulls in the optional `ratatui`/`crossterm`
@@ -32,6 +32,20 @@ gpu-nvidia = []
 # "rustmon A" in docs/crate-checklist.md — pulls in the optional `nix`
 # dependency below (`fs` feature only).
 fs-capacity = ["dep:nix"]
+
+# On-demand route tracing for checked connections in the TUI's connections
+# panel (chunk 17). Approved 2026-08-14, proposal "rustmon D" in
+# docs/crate-checklist.md — pulls in `nix`'s `net` feature (raw ICMP
+# sockets, and `SockaddrIn` to address the probe target — the checklist's
+# own research initially scoped this as just `socket`, but `SockaddrIn` is
+# additionally gated behind `net`; `net = ["socket"]` in nix's own
+# Cargo.toml, so this is a strict superset with the exact same
+# zero-new-transitive-dependency footprint the proposal claimed, just the
+# right feature name). Needs `CAP_NET_RAW` to actually produce a route;
+# without it, gracefully reports "unavailable" rather than erroring (see
+# `net_probe::traceroute`'s own doc). Only meaningful alongside `tui`
+# (traceroute is triggered from the connections panel, nowhere else).
+traceroute = ["dep:nix", "nix/net"]
 
 [dependencies]
 crossterm = { version = "0.29.0", optional = true }

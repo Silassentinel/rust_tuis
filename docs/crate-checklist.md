@@ -251,7 +251,7 @@ connections panel, chunk 15). **Not a new crate** — `nix` is already
 approved and in the tree (rustlogger's pty handling; rustmon's own
 `fs-capacity`, "rustmon A" above). This is a feature-surface addition to
 the existing `nix = { version = "0.31", features = ["fs"] }` line in
-`rustmon/Cargo.toml`, becoming `features = ["fs", "socket"]` — the same
+`rustmon/Cargo.toml`, becoming `features = ["fs", "net"]` — the same
 "same crate, just the per-feature justification" shape as rustlogger's
 "chunk 4 nix feature additions" entry near the top of this file, so the
 ten-point table isn't repeated here either.
@@ -265,18 +265,33 @@ ten-point table isn't repeated here either.
 | 5 | License | MIT (unchanged). |
 | 6 | Security | Raw socket creation (`SOCK_RAW`) requires `CAP_NET_RAW` — confirmed via `man 7 raw` on this machine ("a process must have the CAP_NET_RAW capability... to create a raw socket"; `EPERM` otherwise). This is the substantive point of this proposal: `EPERM`/`EACCES` on socket creation must be fail-soft absence ("route tracing unavailable — needs `CAP_NET_RAW`"), exactly the same "some sensors need root, and that's fine" pattern already established for hwmon sensors — never an error, never a reason for rustmon to suggest running as root or gaining a capability it doesn't already have. The ICMP packet construction/parsing (checksums, type/code fields, the embedded-original-packet in a Time Exceeded message) is hand-rolled on top of `nix`'s generic socket primitives — `nix` has no ICMP-specific helper — and needs the same bounds-checked, no-panic discipline every other hand-rolled parser in this crate already has, since a probe reply is network-supplied (if less adversarial than a public-facing service: replies only ever come from routers actually on the path to an address rustmon itself chose to probe). |
 | 7 | API stability | Unchanged from the existing `nix` approval. |
-| 8 | Footprint | Confirmed by reading the vendored `nix` 0.31.3 source directly: the `socket` feature (`features = ["fs", "socket"]`) only pulls in `memoffset`, which is already a transitive dependency of `nix` regardless of this feature — **zero new transitive dependencies**. `nix::sys::socket::{socket, setsockopt, sendto, recvfrom}` and `sockopt::Ipv4Ttl` all confirmed present under this feature and sufficient for the probe loop (arbitrary-domain socket creation, per-hop `IP_TTL`, send/receive with source-address capture). |
+| 8 | Footprint | Confirmed by reading the vendored `nix` 0.31.3 source directly: `net = ["socket"]` in `nix`'s own `Cargo.toml`, and the `socket` feature it implies only pulls in `memoffset`, which is already a transitive dependency of `nix` regardless — **zero new transitive dependencies either way**. `nix::sys::socket::{socket, setsockopt, sendto, recvfrom}` and `sockopt::Ipv4Ttl` all confirmed present under `socket`; `SockaddrIn` (needed to actually address the probe's destination) turned out to additionally require `net` specifically, found while implementing chunk 17, not before it — see the amendment below. |
 | 9 | Platform | Unchanged — Linux is the target, already established. |
 | 10 | MSRV | Unchanged from the existing `nix` approval. |
 
-**Recommendation:** approve, scoped to adding exactly `socket` to the existing
-`nix` feature list. Route tracing itself stays scoped to on-demand, TUI-only,
-never wired into `--once`/`--summary` (too slow — the same "no rates in
-`--once`" precedent this crate already established, just bigger), and always
-fails soft to "unavailable" rather than erroring when `CAP_NET_RAW` isn't
-present — which, per the check above, is the situation on this exact machine
-today unless the built binary is explicitly granted the capability (e.g.
-`sudo setcap cap_net_raw+ep target/release/rustmon`) or run as root for
-testing.
+**Recommendation:** approve, scoped to adding `net` (which implies `socket`)
+to the existing `nix` feature list. Route tracing itself stays scoped to
+on-demand, TUI-only, never wired into `--once`/`--summary` (too slow — the
+same "no rates in `--once`" precedent this crate already established, just
+bigger), and always fails soft to "unavailable" rather than erroring when
+`CAP_NET_RAW` isn't present — which, per the check above, is the situation on
+this exact machine today unless the built binary is explicitly granted the
+capability (e.g. `sudo setcap cap_net_raw+ep target/release/rustmon`) or run
+as root for testing.
 
-**Decision:** _pending._
+**Decision (2026-08-14): approved — `net` added to the existing `nix`
+feature list (`features = ["fs", "net"]`), exactly as scoped above.**
+
+**Amendment (2026-08-14, found while implementing chunk 17):** the original
+research above scoped this to exactly `socket`, and verified `nix`'s socket
+primitives under that feature — correctly. What it missed: `SockaddrIn`, the
+type needed to actually *address* an IPv4 destination for `sendto`, is gated
+behind `net` specifically, not `socket` alone (confirmed: `nix`'s own
+`sys/socket/mod.rs` re-exports it under `#[cfg(feature = "net")]`). Caught by
+the compiler on the first build attempt, not by review — `cargo build`
+refused to compile with `socket` alone, named exactly the missing type and
+exactly which feature gates it. `net = ["socket"]` in `nix`'s own feature
+graph, so this is a strict superset with the identical zero-new-dependency
+footprint the original approval was granted on — the fix is a one-word
+feature-name correction (`socket` → `net`), not a re-review, and is what's
+actually in `rustmon/Cargo.toml`.

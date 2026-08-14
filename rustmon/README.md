@@ -4,30 +4,39 @@ A read-only hardware monitor for Linux. Part of the [`rust_tuis`](../README.md)
 collection.
 
 > **Status: the live TUI, `--once`, and `--summary` all work and are fully
-> tested — including per-connection DNS resolution.** 363 unit tests + 8
-> end-to-end tests against the compiled binary, all green. `rustmon`,
-> `rustmon --once`, `rustmon --once --format json`, and `rustmon --summary`
-> are all real, working commands — run for real against this machine and
-> verified, not just unit-tested: the JSON was piped through Python's
-> `json.load` to confirm it's genuinely valid, then checked field by field
-> against real hardware; the live TUI was driven interactively through a
-> real pty; `--summary` was timed at ~7–23ms across dozens of runs (well
-> under its 100ms budget). Every collector except NVIDIA GPU support has
-> been verified against real hardware, not just fixtures — CPU/memory
-> against `free -h`/`nproc`/`uptime -s`; thermal against 7 real hwmon chips;
-> disk/net against this machine's actual `/proc/diskstats`,
-> `/proc/self/mounts`, and `/proc/net/dev`; mount capacity against `df -B1`
-> (byte-exact on every mount); AMD GPU against two real cards; connections
-> against `ss -tp` (every attributable process/port/remote-endpoint match
-> exact); **and the connections panel's checkbox/DNS resolution driven live
-> through a real pty against this machine's actual connections — resolving
-> a genuinely NXDOMAIN remote IP correctly showed `no PTR record`, applied
-> across every one of the dozen-plus connections sharing that address**.
-> NVIDIA GPU support was declined (chunk 10's remainder, `nvml-wrapper`) — no
-> NVIDIA hardware on the target machine; AMD/Intel GPU support is
-> unaffected. The original 11-chunk build plan is complete; a second phase
-> (man page, `--summary`, connection visibility with opt-in DNS/traceroute)
-> is in progress — see `docs/TODO-rustmon.md` chunks 12 onward.
+> tested — including per-connection DNS resolution and route tracing.** 374
+> unit tests + 8 end-to-end tests against the compiled binary in the default
+> build, all green (also verified at 361 unit tests with `tui` and no
+> `traceroute` feature, and 277 unit tests with `--no-default-features`).
+> `rustmon`, `rustmon --once`, `rustmon --once --format json`, and
+> `rustmon --summary` are all real, working commands — run for real against
+> this machine and verified, not just unit-tested: the JSON was piped
+> through Python's `json.load` to confirm it's genuinely valid, then checked
+> field by field against real hardware; the live TUI was driven
+> interactively through a real pty; `--summary` was timed at ~7–23ms across
+> dozens of runs (well under its 100ms budget). Every collector except
+> NVIDIA GPU support has been verified against real hardware, not just
+> fixtures — CPU/memory against `free -h`/`nproc`/`uptime -s`; thermal
+> against 7 real hwmon chips; disk/net against this machine's actual
+> `/proc/diskstats`, `/proc/self/mounts`, and `/proc/net/dev`; mount
+> capacity against `df -B1` (byte-exact on every mount); AMD GPU against two
+> real cards; connections against `ss -tp` (every attributable
+> process/port/remote-endpoint match exact); **and the connections panel's
+> checkbox/DNS resolution driven live through a real pty against this
+> machine's actual connections — resolving a genuinely NXDOMAIN remote IP
+> correctly showed `no PTR record`, applied across every one of the
+> dozen-plus connections sharing that address**. Route tracing (raw ICMP,
+> `CAP_NET_RAW`-gated) is covered by unit tests including a genuinely
+> unprivileged fail-soft run (`unavailable`, no crash) and a real-pty check
+> of the `tracing…` → `unavailable` state transition; a real privileged
+> trace against live network hops was attempted but blocked in this sandbox
+> by `sudo` requiring an interactive password — a known verification gap,
+> noted here rather than glossed over. NVIDIA GPU support was declined
+> (chunk 10's remainder, `nvml-wrapper`) — no NVIDIA hardware on the target
+> machine; AMD/Intel GPU support is unaffected. The original 11-chunk build
+> plan is complete; a second phase (man page, `--summary`, connection
+> visibility with opt-in DNS/traceroute) is complete too — see
+> `docs/TODO-rustmon.md` chunks 12–17.
 
 ## What it does
 
@@ -65,16 +74,22 @@ With the connections panel focused:
 |---|---|
 | `Up` / `Down` | Move the row cursor |
 | `x` | Toggle the cursor row's checkbox |
-| `Enter` | Resolve every checked row's remote IP to a domain name |
+| `Enter` | Resolve every checked row's remote IP to a domain name, and (on builds with the `traceroute` feature) a route |
 
-Resolution is a hand-rolled reverse-DNS (PTR) client over
+Domain resolution is a hand-rolled reverse-DNS (PTR) client over
 `std::net::UdpSocket` — no new dependency, and it transparently uses
 whatever resolver `/etc/resolv.conf` points at (including a local
 [`unbound`](https://nlnetlabs.nl/projects/unbound/about/) instance, if
-that's what you run). It's cached per remote IP, not per connection, so
-checking and resolving one connection resolves every other connection
-sharing that address too. Nothing is resolved automatically — only checked
-rows, only on `Enter`.
+that's what you run). Route tracing is a hand-rolled ICMP traceroute over a
+raw socket (`nix`'s `net` feature — see `docs/crate-checklist.md`), one
+probe per TTL, each silent hop shown as `*`; it needs `CAP_NET_RAW` (see
+`man/rustmon.1`'s `PRIVILEGES` section for the `setcap` grant) and only
+exists in builds with the `traceroute` Cargo feature (on by default; IPv4
+only — an IPv6 remote connection still gets a domain name, just no route).
+Both are cached per remote IP, not per connection, so checking and
+resolving one connection resolves every other connection sharing that
+address too. Nothing is resolved automatically — only checked rows, only on
+`Enter`.
 
 ### Shell-prompt summary mode
 
@@ -276,6 +291,14 @@ kernel and driver:
   That connection still shows up, just with `pid`/`program` absent and only
   its owning `uid` known — never as an error, and never a reason to suggest
   running rustmon as root.
+- Route tracing (the connections panel's `Enter` key, on builds with the
+  `traceroute` feature) is the one real exception: raw ICMP sockets need
+  the `CAP_NET_RAW` capability. Without it, tracing degrades to
+  `unavailable` in that one field — never an error, never a reason to run
+  rustmon as root. If you want it, grant the capability to the binary
+  itself (`sudo setcap cap_net_raw+ep $(command -v rustmon)`, see
+  `man/rustmon.1`'s `PRIVILEGES` section) so rustmon never needs to run as
+  root afterward.
 
 rustmon never re-execs itself under `sudo`, is never meant to be installed
 setuid, and there is no code path that requests elevated privileges — running
@@ -307,20 +330,21 @@ Full reasoning: `docs/rustmon-design.md`.
 
 ## Dependencies
 
-**Three, all opt-out.** `nix` (`fs` feature, for `statvfs`) and `ratatui` +
-`crossterm` (the live TUI) are all in `default` — a plain `cargo build`/
-`cargo run` pulls in all three and gives you the full tool, live TUI
-included. `cargo build --no-default-features` stays genuinely
-dependency-free; `--once --format json` still works, just without per-mount
-capacity numbers, and bare `rustmon` (no `--once`) returns
-`Error::Unsupported` instead of a UI that was never compiled in.
+**Three crates, all opt-out.** `nix` (`fs` + `net` features, for `statvfs`
+and raw ICMP sockets), `ratatui` + `crossterm` (the live TUI) are all in
+`default` — a plain `cargo build`/`cargo run` pulls in all three and gives
+you the full tool, live TUI included. `cargo build --no-default-features`
+stays genuinely dependency-free; `--once --format json` still works, just
+without per-mount capacity numbers, and bare `rustmon` (no `--once`)
+returns `Error::Unsupported` instead of a UI that was never compiled in.
 
-Three crate proposals live in `docs/crate-checklist.md`; two are approved:
+Four crate proposals live in `docs/crate-checklist.md`; three are approved:
 
 | Feature | Needs | Gives you | Status |
 |---|---|---|---|
 | `fs-capacity` | `nix` (`fs`) | per-mount disk capacity via `statvfs` | **approved, in `default`** |
 | `tui` | `ratatui`, `crossterm` | the live terminal UI | **approved and implemented, in `default`** |
+| `traceroute` | `nix` (`net`) | route tracing via raw ICMP (`CAP_NET_RAW`) | **approved and implemented, in `default`** |
 | `gpu-nvidia` | `nvml-wrapper` | NVIDIA GPU metrics | declined — no NVIDIA hardware to target |
 
 ```sh

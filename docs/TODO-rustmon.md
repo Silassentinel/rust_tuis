@@ -896,16 +896,87 @@ sign-off; the other five are not.
       dependencies (`socket` only pulls in `memoffset`, already transitive
       regardless). Chunk 17 does not start until this is signed off.
 
-- [ ] **17. Traceroute. 🔒 BLOCKED — crate checklist (chunk 16).** Hand-rolled
-      ICMP Echo Request/Reply/Time-Exceeded construction and parsing (RFC
-      1071 checksum, bounds-checked, no panics) over a raw socket, one probe
-      per TTL with a thread+channel+timeout shape reused from chunk 8's
-      `read_capacity`. `EPERM`/`EACCES` on socket creation is fail-soft
-      absence, never an error — same "some sensors need root, and that's
-      fine" pattern as the rest of the crate, scaled up to a whole feature.
-      Triggered the same way as chunk 15's DNS lookup (`Enter` on checked
-      rows), never wired into `--once`/`--summary` (too slow — same "no
-      rates in `--once`" precedent, just bigger).
+- [x] **17. Traceroute.** *(done 2026-08-14)* Hand-rolled ICMP Echo
+      Request/Reply/Time-Exceeded construction and parsing (RFC 1071
+      checksum, bounds-checked throughout via `slice::get`, no panics) over
+      a raw socket, IPv4 only, one probe per TTL up to 30 hops with a
+      1.5s-per-hop timeout and an 18s overall budget. `EPERM`/`EACCES` on
+      socket creation (no `CAP_NET_RAW`) is fail-soft absence — `trace()`
+      returns `None`, never an error — the same "some sensors need root,
+      and that's fine" pattern as the rest of the crate, scaled up to a
+      whole feature. New `traceroute` Cargo feature (in `default`,
+      independent of `tui` — `tui` without `traceroute` stays a fully valid
+      build with DNS resolution but no route tracing), pulling in `nix`'s
+      `net` feature (approved as "rustmon D" in `docs/crate-checklist.md`).
+      Triggered the same way as chunk 15's DNS lookup — one `Enter` on
+      checked rows now spawns both a DNS thread and a traceroute thread per
+      newly-triggered IP — never wired into `--once`/`--summary` (too slow
+      — same "no rates in `--once`" precedent, just bigger).
+
+11 new tests, all directly in this chunk's own modules (`net_probe::traceroute`'s
+      10 plus one new `ui::widgets` route-rendering test) — 374 unit + 8
+      integration = 382 total in the default build, up from 371 before this
+      chunk. `cargo test`/`cargo clippy` also confirmed clean, separately,
+      in two other feature combinations: `tui` without `traceroute` (361
+      unit tests — this combination is now a real, independently valid
+      build rather than an untested assumption) and
+      `--no-default-features` (277 unit tests, unchanged — traceroute never
+      touches the dependency-free build). Real-world verification, same bar as every
+      other chunk: the checksum algorithm's self-verifying property (a
+      correctly-checksummed buffer always re-sums to exactly zero) rather
+      than a hand-picked reference value; the Time-Exceeded parser tested
+      against a realistic embedded-original-packet payload, not a
+      simplified stand-in; and — since this sandbox genuinely has no
+      `CAP_NET_RAW` (confirmed and cited in the crate-checklist proposal
+      itself) — the fail-soft "unavailable" path is exercised for real, not
+      mocked, both directly (`trace()` returns `None` here, asserted) and
+      through a live pty session showing the connections panel correctly
+      transition `tracing…` → `unavailable` end to end, with a clean exit
+      and terminal restore. **A true privileged real-network trace (with
+      `CAP_NET_RAW` actually granted) was not run** — doing so needed
+      `sudo`, which needs an interactive password this session cannot
+      supply (and entering one is outside what this crate — or this
+      assistant — does regardless of who's asking); this is recorded here
+      as a known verification gap, not silently glossed over.
+
+      Decisions worth knowing about:
+
+      1. **Found and fixed a real crate-checklist gap during
+         implementation, not review.** The approved proposal scoped `nix`'s
+         `socket` feature as sufficient; the compiler disagreed on the
+         first build attempt, naming exactly the missing type
+         (`SockaddrIn`, needed to address the probe's destination) and
+         exactly which feature actually gates it (`net`, not `socket`
+         alone — though `net = ["socket"]` in `nix`'s own feature graph, so
+         it's a strict superset with the identical zero-new-dependency
+         footprint the approval was granted on). Corrected in both
+         `rustmon/Cargo.toml` and the crate-checklist entry itself, with an
+         explicit amendment note — a one-feature-name fix, not a re-review,
+         but the kind of thing worth being honest about rather than quietly
+         editing the original proposal as if it had always said `net`.
+      2. **A whole traceroute per `Enter` press runs on exactly one
+         background thread**, not one thread per hop. The plan's own
+         sketch suggested a thread-per-hop shape mirroring `read_capacity`
+         literally; the simpler "one thread walks all 30 possible hops
+         sequentially, sends one final result" design was chosen instead —
+         no incremental per-hop UI updates in this version, but
+         meaningfully less complexity for a feature explicitly described as
+         "doesn't have to be instant." Per-hop streaming is a reasonable
+         later enhancement if the all-at-once wait proves annoying in
+         practice, not something this chunk needed to solve pre-emptively.
+      3. **`Enrichment::route` and the `EnrichmentUpdate::Route` variant
+         are behind `#[cfg(feature = "traceroute")]`**, unlike `domains`
+         which is unconditional — this is what makes `tui` without
+         `traceroute` a real, independently buildable and testable
+         configuration rather than an assumption nobody checked. Caught by
+         building that exact combination deliberately, not by accident.
+      4. **The connections panel doesn't distinguish "trace timed out"
+         from "no `CAP_NET_RAW`"** — both collapse to `Failed` →
+         `unavailable` in the UI. A more granular error channel was
+         considered and rejected as premature: the user-facing action is
+         identical either way (nothing to do about it from inside the
+         TUI), so a finer distinction would be detail with no decision
+         attached to it.
 
 ---
 

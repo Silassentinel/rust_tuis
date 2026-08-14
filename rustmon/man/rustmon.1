@@ -118,16 +118,65 @@ Move the row cursor.
 Toggle the cursor row's checkbox.
 .TP
 .B Enter
-Resolve every checked row's remote IP to a domain name (a hand\-rolled
-reverse\-DNS lookup, cached per IP \(em checking one connection resolves
-every other connection sharing that address too). Best\-effort: shows
+Resolve every checked row's remote IP: a domain name (a hand\-rolled
+reverse\-DNS lookup) and, on builds with the
+.B traceroute
+feature, a route (raw ICMP, one hop per TTL). Both are cached per IP \(em
+checking one connection resolves every other connection sharing that
+address too \(em and never triggered automatically, only on request, for
+exactly the rows you check.
+.PP
+Domain resolution shows
 .I resolving...
 while pending,
 .I "no PTR record"
 if the query succeeded but found nothing, or
 .I failed
-on a timeout or an unreachable/unconfigured resolver. Never triggered
-automatically \(em only on request, for exactly the rows you check.
+on a timeout or an unreachable/unconfigured resolver.
+.PP
+Route tracing (requires
+.B CAP_NET_RAW
+\(em see
+.B PRIVILEGES
+below) shows
+.I tracing...
+while pending, then each hop's address separated by
+.RI \(lq " \-> " \(rq ,
+with
+.B *
+for a hop that didn't reply in time (the standard
+.BR traceroute (8)
+convention), or
+.I unavailable
+if the raw socket couldn't be created at all (no
+.BR CAP_NET_RAW ,
+or the
+.B traceroute
+feature wasn't compiled in).
+.SH PRIVILEGES
+Every collector in
+.B rustmon
+runs fully unprivileged \(em see
+.B "What needs root, and why"
+in the project README. Route tracing (this section exists because of it) is
+the one exception: raw ICMP sockets need the
+.B CAP_NET_RAW
+capability. Without it, route tracing degrades to
+.I unavailable
+in the connections panel rather than erroring \(em everything else in
+.B rustmon
+is completely unaffected. To use it:
+.PP
+.RS
+.nf
+sudo setcap cap_net_raw+ep $(command \-v rustmon)
+.fi
+.RE
+.PP
+grants the capability to the binary itself, so
+.B rustmon
+never needs to run as root afterward. Do this only if you actually want
+route tracing; it is entirely optional.
 .SH SUMMARY MODE
 .B rustmon \-\-summary
 is built for a shell prompt (e.g. an oh\-my\-posh command segment): it must
@@ -235,12 +284,22 @@ still the recommended way to run
 .BR rustmon ;
 that one sensor is reported as absent rather than as an error, and every
 other sensor on the same chip is unaffected.
+.IP \(bu 2
+Route tracing is IPv4 only \(em an IPv6 remote connection never gets a
+route (its checkbox still resolves a domain name normally). Needs
+.B CAP_NET_RAW
+(see
+.BR PRIVILEGES ),
+and only exists in builds with the
+.B traceroute
+Cargo feature (on by default).
 .SH SEE ALSO
 .BR top (1),
 .BR free (1),
 .BR sensors (1),
 .BR ss (1),
-.BR df (1)
+.BR df (1),
+.BR traceroute (8)
 .SH AUTHOR
 See the project repository for source, design notes, and the build log:
 .I https://github.com/Silassentinel/rust_tuis
