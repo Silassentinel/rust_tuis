@@ -882,15 +882,19 @@ sign-off; the other five are not.
          shrink between refreshes (a socket closing), so this is new
          territory none of the other six panels needed.
 
-- [ ] **16. Crate-checklist proposal for chunk 17.** 🔒 Not a new crate — a
-      feature addition to the already-approved `nix` (add `socket` to the
-      existing `features = ["fs"]` line), following rustlogger's "chunk 4
-      nix feature additions" precedent. Written and submitted for sign-off
-      before any code; confirmed this session that raw ICMP + `CAP_NET_RAW`
-      is required (this machine's `net.ipv4.ping_group_range` is `1 0` —
-      disabled — so unprivileged ping sockets are a dead end here), and
-      that `nix` 0.31.3's `socket`/`setsockopt`/`sendto`/`recvfrom` cover
-      everything needed with zero new transitive dependencies.
+- [x] **16. Crate-checklist proposal for chunk 17.** *(written 2026-08-14,
+      awaiting sign-off)* Not a new crate — a feature addition to the
+      already-approved `nix` (add `socket` to the existing `features =
+      ["fs"]` line), following rustlogger's "chunk 4 nix feature additions"
+      precedent — see "rustmon D" in `docs/crate-checklist.md`. Re-confirmed
+      directly on this machine while writing the proposal: raw ICMP +
+      `CAP_NET_RAW` is required (`net.ipv4.ping_group_range` is `1 0` —
+      disabled — so unprivileged ping sockets are a dead end here; `man 7
+      raw` confirms the `CAP_NET_RAW` requirement), and `nix` 0.31.3's
+      `socket`/`setsockopt`/`sendto`/`recvfrom` (confirmed present in the
+      vendored source) cover everything needed with zero new transitive
+      dependencies (`socket` only pulls in `memoffset`, already transitive
+      regardless). Chunk 17 does not start until this is signed off.
 
 - [ ] **17. Traceroute. 🔒 BLOCKED — crate checklist (chunk 16).** Hand-rolled
       ICMP Echo Request/Reply/Time-Exceeded construction and parsing (RFC

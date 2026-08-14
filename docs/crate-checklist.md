@@ -243,3 +243,40 @@ the process. Tell me which vendor's GPU is in the target machine and that settle
 
 **Decision (2026-08-12): declined — no NVIDIA GPU on the target machine.** Option
 (c): NVIDIA stays unsupported. AMD/Intel GPU support (chunk 10) is unaffected.
+
+## rustmon D: `nix`'s `socket` feature — raw ICMP for traceroute
+
+Blocks chunk 17 only (route tracing on checked connections in the TUI's
+connections panel, chunk 15). **Not a new crate** — `nix` is already
+approved and in the tree (rustlogger's pty handling; rustmon's own
+`fs-capacity`, "rustmon A" above). This is a feature-surface addition to
+the existing `nix = { version = "0.31", features = ["fs"] }` line in
+`rustmon/Cargo.toml`, becoming `features = ["fs", "socket"]` — the same
+"same crate, just the per-feature justification" shape as rustlogger's
+"chunk 4 nix feature additions" entry near the top of this file, so the
+ten-point table isn't repeated here either.
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Problem | `std` has no raw-socket API at all — no `SOCK_RAW`, no `setsockopt(IP_TTL)` to control per-probe hop count, no way to read an ICMP header off a raw datagram. All three are required for a TTL-incrementing traceroute. |
+| 2 | Alternatives | (a) Unprivileged Linux "ping sockets" (`SOCK_DGRAM`+`IPPROTO_ICMP`), avoiding the privilege requirement below — **checked directly on this machine and ruled out**: `cat /proc/sys/net/ipv4/ping_group_range` reads `1 0`, the kernel's own sentinel for "no group may open one," so this path is a dead end here out of the box, and it was never independently confirmed (in the research behind this proposal) that ping sockets even deliver *intermediate*-hop Time Exceeded replies the way a raw socket does — an unproven mechanism that also doesn't work on the actual target machine isn't worth building. (b) Hand-rolled `libc` FFI directly, bypassing `nix`'s safety wrappers — strictly worse than (c): more `unsafe` for this crate to own directly, no upside since `nix` is already approved and in the tree. (c) Raw ICMP via `nix`, gated behind graceful fail-soft absence when the required capability isn't present — the recommendation below. |
+| 3 | Maintenance | Unchanged from the existing `nix` approval — same crate, same `0.31` line already in the tree. |
+| 4 | Adoption | Unchanged — one of the most-depended-on crates in the ecosystem. |
+| 5 | License | MIT (unchanged). |
+| 6 | Security | Raw socket creation (`SOCK_RAW`) requires `CAP_NET_RAW` — confirmed via `man 7 raw` on this machine ("a process must have the CAP_NET_RAW capability... to create a raw socket"; `EPERM` otherwise). This is the substantive point of this proposal: `EPERM`/`EACCES` on socket creation must be fail-soft absence ("route tracing unavailable — needs `CAP_NET_RAW`"), exactly the same "some sensors need root, and that's fine" pattern already established for hwmon sensors — never an error, never a reason for rustmon to suggest running as root or gaining a capability it doesn't already have. The ICMP packet construction/parsing (checksums, type/code fields, the embedded-original-packet in a Time Exceeded message) is hand-rolled on top of `nix`'s generic socket primitives — `nix` has no ICMP-specific helper — and needs the same bounds-checked, no-panic discipline every other hand-rolled parser in this crate already has, since a probe reply is network-supplied (if less adversarial than a public-facing service: replies only ever come from routers actually on the path to an address rustmon itself chose to probe). |
+| 7 | API stability | Unchanged from the existing `nix` approval. |
+| 8 | Footprint | Confirmed by reading the vendored `nix` 0.31.3 source directly: the `socket` feature (`features = ["fs", "socket"]`) only pulls in `memoffset`, which is already a transitive dependency of `nix` regardless of this feature — **zero new transitive dependencies**. `nix::sys::socket::{socket, setsockopt, sendto, recvfrom}` and `sockopt::Ipv4Ttl` all confirmed present under this feature and sufficient for the probe loop (arbitrary-domain socket creation, per-hop `IP_TTL`, send/receive with source-address capture). |
+| 9 | Platform | Unchanged — Linux is the target, already established. |
+| 10 | MSRV | Unchanged from the existing `nix` approval. |
+
+**Recommendation:** approve, scoped to adding exactly `socket` to the existing
+`nix` feature list. Route tracing itself stays scoped to on-demand, TUI-only,
+never wired into `--once`/`--summary` (too slow — the same "no rates in
+`--once`" precedent this crate already established, just bigger), and always
+fails soft to "unavailable" rather than erroring when `CAP_NET_RAW` isn't
+present — which, per the check above, is the situation on this exact machine
+today unless the built binary is explicitly granted the capability (e.g.
+`sudo setcap cap_net_raw+ep target/release/rustmon`) or run as root for
+testing.
+
+**Decision:** _pending._
