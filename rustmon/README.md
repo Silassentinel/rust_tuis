@@ -4,22 +4,25 @@ A read-only hardware monitor for Linux. Part of the [`rust_tuis`](../README.md)
 collection.
 
 > **Status: the live TUI, `--once`, and `--summary` all work and are fully
-> tested.** 331 unit tests + 8 end-to-end tests against the compiled binary,
-> all green. `rustmon`, `rustmon --once`, `rustmon --once --format json`, and
-> `rustmon --summary` are all real, working commands — run for real against
-> this machine and verified, not just unit-tested: the JSON was piped through
-> Python's `json.load` to confirm it's genuinely valid, then checked field by
-> field against real hardware; the live TUI was driven interactively through
-> a real pty; `--summary` was timed at ~7–23ms across dozens of runs (well
-> under its 100ms budget) with both its silent and JSON-emitting paths
-> exercised. Every collector except NVIDIA GPU support has been verified
-> against real hardware, not just fixtures — CPU/memory against `free
-> -h`/`nproc`/`uptime -s`; thermal against 7 real hwmon chips; disk/net
-> against this machine's actual `/proc/diskstats`, `/proc/self/mounts`, and
-> `/proc/net/dev`; mount capacity against `df -B1` (byte-exact on every
-> mount); AMD GPU against two real cards; **connections against `ss -tp`
-> (every attributable process/port/remote-endpoint match exact, including
-> fd-level detail, and a real loopback connection correctly excluded)**.
+> tested — including per-connection DNS resolution.** 363 unit tests + 8
+> end-to-end tests against the compiled binary, all green. `rustmon`,
+> `rustmon --once`, `rustmon --once --format json`, and `rustmon --summary`
+> are all real, working commands — run for real against this machine and
+> verified, not just unit-tested: the JSON was piped through Python's
+> `json.load` to confirm it's genuinely valid, then checked field by field
+> against real hardware; the live TUI was driven interactively through a
+> real pty; `--summary` was timed at ~7–23ms across dozens of runs (well
+> under its 100ms budget). Every collector except NVIDIA GPU support has
+> been verified against real hardware, not just fixtures — CPU/memory
+> against `free -h`/`nproc`/`uptime -s`; thermal against 7 real hwmon chips;
+> disk/net against this machine's actual `/proc/diskstats`,
+> `/proc/self/mounts`, and `/proc/net/dev`; mount capacity against `df -B1`
+> (byte-exact on every mount); AMD GPU against two real cards; connections
+> against `ss -tp` (every attributable process/port/remote-endpoint match
+> exact); **and the connections panel's checkbox/DNS resolution driven live
+> through a real pty against this machine's actual connections — resolving
+> a genuinely NXDOMAIN remote IP correctly showed `no PTR record`, applied
+> across every one of the dozen-plus connections sharing that address**.
 > NVIDIA GPU support was declined (chunk 10's remainder, `nvml-wrapper`) — no
 > NVIDIA hardware on the target machine; AMD/Intel GPU support is
 > unaffected. The original 11-chunk build plan is complete; a second phase
@@ -40,21 +43,38 @@ rustmon --summary                # shell-prompt one-liner — works
 
 ### The live TUI
 
-Six panels (CPU, memory, thermal, disk, net, GPU) laid out responsively —
-single column under 60 columns, two columns from 60–119, three from 120 up,
-each panel dropped before it's ever shown squashed to nothing. Panels for
-hardware the machine doesn't have (no GPU, no sensors) are omitted entirely,
-not shown empty.
+Seven panels (CPU, memory, thermal, disk, net, GPU, connections) laid out
+responsively — single column under 60 columns, two columns from 60–119,
+three from 120 up, each panel dropped before it's ever shown squashed to
+nothing. Panels for hardware the machine doesn't have (no GPU, no sensors,
+no internet-facing connections) are omitted entirely, not shown empty.
 
 | Key | Does |
 |---|---|
 | `q`, `Esc`, `Ctrl-C` | Quit |
 | `Tab` / `Shift-Tab` | Cycle panel focus |
-| `1`–`6` | Jump to a panel |
+| `1`–`7` | Jump to a panel |
 | `space` | Pause/resume |
 | `r` | Reset the rate tracker (drops the next interval rather than averaging across the gap) |
 | `?` | Toggle the help overlay |
 | `+` / `-` | Adjust the refresh interval (floor: 100 ms) |
+
+With the connections panel focused:
+
+| Key | Does |
+|---|---|
+| `Up` / `Down` | Move the row cursor |
+| `x` | Toggle the cursor row's checkbox |
+| `Enter` | Resolve every checked row's remote IP to a domain name |
+
+Resolution is a hand-rolled reverse-DNS (PTR) client over
+`std::net::UdpSocket` — no new dependency, and it transparently uses
+whatever resolver `/etc/resolv.conf` points at (including a local
+[`unbound`](https://nlnetlabs.nl/projects/unbound/about/) instance, if
+that's what you run). It's cached per remote IP, not per connection, so
+checking and resolving one connection resolves every other connection
+sharing that address too. Nothing is resolved automatically — only checked
+rows, only on `Enter`.
 
 ### Shell-prompt summary mode
 

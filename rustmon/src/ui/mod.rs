@@ -63,6 +63,11 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     app.refresh()?;
 
     while !app.should_quit {
+        // Non-blocking: folds in whatever DNS results have arrived since
+        // the last iteration before drawing, so a resolved domain shows up
+        // as soon as it's ready rather than waiting for the next refresh.
+        app.drain_enrichment();
+
         terminal.draw(|frame| draw_frame(frame, app)).map_err(io_err)?;
 
         let timeout = app.time_until_refresh();
@@ -145,6 +150,16 @@ fn draw_frame(frame: &mut Frame, app: &App) {
     if let Some(rect) = computed.gpu {
         widgets::draw_gpu(frame, rect, snapshot);
     }
+    if let Some(rect) = computed.connections {
+        widgets::draw_connections(
+            frame,
+            rect,
+            snapshot,
+            app.connections_cursor,
+            &app.connections_checked,
+            &app.enrichment,
+        );
+    }
     if let Some(rect) = computed.footer {
         widgets::draw_footer(frame, rect, snapshot, app.config.verbose);
     }
@@ -172,6 +187,7 @@ fn presence_of(snapshot: &Snapshot) -> layout::PanelPresence {
             .is_some_and(|d| !d.devices.is_empty() || !d.mounts.is_empty()),
         net: snapshot.net.as_ref().is_some_and(|n| !n.interfaces.is_empty()),
         gpu: snapshot.gpus.as_ref().is_some_and(|g| !g.gpus.is_empty()),
+        connections: snapshot.connections.as_ref().is_some_and(|c| !c.connections.is_empty()),
     }
 }
 

@@ -18,15 +18,18 @@
 //! `ratatui`/`crossterm` types this module deliberately stays free of — see
 //! [`KeyPress`]'s own doc for why.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::delta::{RateTracker, Rates};
 use crate::error::Result;
+use crate::sample::{ConnProtocol, Connection, Snapshot};
 use crate::sysfs::{sanitize_kernel_string, SysfsReader};
-use crate::sample::Snapshot;
 
 /// Cap on the hostname/kernel-release strings read once at startup. Both are
 /// always short in practice; this is the same defensive cap every other
@@ -44,10 +47,11 @@ pub enum Panel {
     Disk,
     Net,
     Gpu,
+    Connections,
 }
 
 impl Panel {
-    const ALL: [Panel; 7] = [
+    const ALL: [Panel; 8] = [
         Panel::Overview,
         Panel::Cpu,
         Panel::Memory,
@@ -55,6 +59,7 @@ impl Panel {
         Panel::Disk,
         Panel::Net,
         Panel::Gpu,
+        Panel::Connections,
     ];
 
     fn index(self) -> usize {
@@ -69,10 +74,12 @@ impl Panel {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
-    /// `'1'..='6'` map onto the six data panels in the order they're listed
-    /// in `ALL` (skipping `Overview`, which has no digit of its own — it's
-    /// reached only by cycling with `Tab`/`Shift-Tab`). Any other character
-    /// is `None`.
+    /// `'1'..='7'` map onto the seven data panels in the order they're
+    /// listed in `ALL` (skipping `Overview`, which has no digit of its own
+    /// — it's reached only by cycling with `Tab`/`Shift-Tab`). `7` was
+    /// appended for `Connections` rather than renumbering `1`-`6`, so every
+    /// existing binding stays exactly as it was. Any other character is
+    /// `None`.
     pub fn from_digit(c: char) -> Option<Panel> {
         match c {
             '1' => Some(Panel::Cpu),
@@ -81,9 +88,65 @@ impl Panel {
             '4' => Some(Panel::Disk),
             '5' => Some(Panel::Net),
             '6' => Some(Panel::Gpu),
+            '7' => Some(Panel::Connections),
             _ => None,
         }
     }
+}
+
+/// One connection's row identity, for cursor/checkbox tracking in the
+/// connections panel — stable across refreshes as long as the underlying
+/// connection stays open. Deliberately *not* the whole [`Connection`]
+/// (which also carries `state`/`uid`/`pid`/`program`, none of which affect
+/// what row this is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnKey {
+    pub protocol: ConnProtocol,
+    pub local_addr: IpAddr,
+    pub local_port: u16,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
+}
+
+impl ConnKey {
+    pub fn of(c: &Connection) -> Self {
+        ConnKey {
+            protocol: c.protocol,
+            local_addr: c.local_addr,
+            local_port: c.local_port,
+            remote_addr: c.remote_addr,
+            remote_port: c.remote_port,
+        }
+    }
+}
+
+/// Resolution state for one field of one remote IP's enrichment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EnrichState<T> {
+    #[default]
+    NotRequested,
+    Pending,
+    Done(T),
+    Failed,
+}
+
+/// What's known about one remote IP beyond the raw connection data —
+/// resolved lazily, on request (see [`App::resolve_checked`]), and cached
+/// here for the process's lifetime. Keyed by IP, not by connection: this is
+/// a property of the remote address, so resolving it once for one
+/// connection resolves it for every other connection sharing that address
+/// too, and the result outlives any one connection closing.
+#[derive(Debug, Clone, Default)]
+pub struct Enrichment {
+    pub domains: EnrichState<Vec<String>>,
+}
+
+/// A background lookup's result, reported back over [`App`]'s enrichment
+/// channel. `None` inside `Domains` means the lookup completed but found
+/// nothing (or failed) — see [`crate::net_probe::dns::resolve_ptr`]'s own
+/// doc for the exact distinction it draws.
+enum EnrichmentUpdate {
+    Domains(IpAddr, Option<Vec<String>>),
 }
 
 /// Everything the UI needs between frames.
@@ -116,6 +179,16 @@ pub struct App {
     pub hostname: String,
     pub kernel: String,
 
+    /// Which row is highlighted in the connections panel.
+    pub connections_cursor: usize,
+    /// Which rows are checkbox-marked for enrichment, keyed by row
+    /// identity rather than index — see [`ConnKey`].
+    pub connections_checked: HashSet<ConnKey>,
+    /// DNS (and, once traceroute lands, route) results, keyed by remote IP.
+    pub enrichment: HashMap<IpAddr, Enrichment>,
+    enrichment_tx: mpsc::Sender<EnrichmentUpdate>,
+    enrichment_rx: mpsc::Receiver<EnrichmentUpdate>,
+
     last_refresh: Instant,
 }
 
@@ -133,6 +206,8 @@ impl App {
             .checked_sub(config.interval)
             .unwrap_or_else(Instant::now);
 
+        let (enrichment_tx, enrichment_rx) = mpsc::channel();
+
         Ok(App {
             config,
             registry,
@@ -146,6 +221,11 @@ impl App {
             should_quit: false,
             hostname,
             kernel,
+            connections_cursor: 0,
+            connections_checked: HashSet::new(),
+            enrichment: HashMap::new(),
+            enrichment_tx,
+            enrichment_rx,
             last_refresh,
         })
     }
@@ -166,25 +246,43 @@ impl App {
         self.history.make_contiguous();
 
         self.current = Some(snapshot);
+        self.clamp_connections_cursor();
         self.last_refresh = Instant::now();
         Ok(())
     }
 
+    /// The connection list is ephemeral (sockets open and close every
+    /// refresh), so the cursor can end up past the end of a shorter list —
+    /// clamp it here (called from [`Self::refresh`]) rather than at every
+    /// read site. Split out from `refresh` so it's directly testable
+    /// without needing a real collector round trip to shrink the list.
+    fn clamp_connections_cursor(&mut self) {
+        let Some(len) = self.connections_len() else { return };
+        self.connections_cursor = if len == 0 { 0 } else { self.connections_cursor.min(len - 1) };
+    }
+
     /// Handle one key press.
     ///
-    /// Bindings: `q`/`Esc` quit, `Tab`/`Shift-Tab` cycle panels, `1`-`6` jump
+    /// Bindings: `q`/`Esc` quit, `Tab`/`Shift-Tab` cycle panels, `1`-`7` jump
     /// to a panel, `space` pause, `r` reset the rate tracker, `?` help,
     /// `+`/`-` adjust the interval (clamped to [`crate::config::MIN_INTERVAL`]).
+    /// With the connections panel focused: `Up`/`Down` move the row cursor,
+    /// `x` toggles the cursor row's checkbox, `Enter` resolves every
+    /// checked row's remote IP (see [`Self::resolve_checked`]).
     pub fn on_key(&mut self, key: KeyPress) -> Result<()> {
         match key {
             KeyPress::CtrlC | KeyPress::Esc => self.should_quit = true,
             KeyPress::Tab => self.focus = self.focus.next(),
             KeyPress::BackTab => self.focus = self.focus.prev(),
+            KeyPress::Up if self.focus == Panel::Connections => self.move_connections_cursor(-1),
+            KeyPress::Down if self.focus == Panel::Connections => self.move_connections_cursor(1),
+            KeyPress::Enter if self.focus == Panel::Connections => self.resolve_checked(),
             KeyPress::Char(c) => match c {
                 'q' => self.should_quit = true,
                 '?' => self.show_help = !self.show_help,
                 ' ' => self.paused = !self.paused,
                 'r' => self.tracker.reset(),
+                'x' if self.focus == Panel::Connections => self.toggle_checked(),
                 '+' | '=' => {
                     self.config.interval = self.config.interval.saturating_add(Duration::from_millis(250));
                 }
@@ -195,7 +293,7 @@ impl App {
                         .saturating_sub(Duration::from_millis(250))
                         .max(crate::config::MIN_INTERVAL);
                 }
-                '1'..='6' => {
+                '1'..='7' => {
                     if let Some(panel) = Panel::from_digit(c) {
                         self.focus = panel;
                     }
@@ -205,6 +303,105 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Move the connections-panel row cursor by `delta`, wrapping — a no-op
+    /// if there's no connection data (or none) to move a cursor over.
+    fn move_connections_cursor(&mut self, delta: isize) {
+        let Some(len) = self.connections_len() else { return };
+        if len == 0 {
+            self.connections_cursor = 0;
+            return;
+        }
+        let next = (self.connections_cursor as isize + delta).rem_euclid(len as isize);
+        self.connections_cursor = next as usize;
+    }
+
+    /// Toggle the cursor row's checkbox.
+    fn toggle_checked(&mut self) {
+        let Some(conn) = self
+            .current
+            .as_ref()
+            .and_then(|s| s.connections.as_ref())
+            .and_then(|c| c.connections.get(self.connections_cursor))
+        else {
+            return;
+        };
+        let key = ConnKey::of(conn);
+        if !self.connections_checked.remove(&key) {
+            self.connections_checked.insert(key);
+        }
+    }
+
+    fn connections_len(&self) -> Option<usize> {
+        self.current.as_ref().and_then(|s| s.connections.as_ref()).map(|c| c.connections.len())
+    }
+
+    /// Kick off DNS resolution for every checked row's remote IP that isn't
+    /// already `Pending`/`Done` — one background thread per newly-triggered
+    /// IP, the same thread-spawn-with-a-channel shape
+    /// `collectors::disk::read_capacity` uses for a single bounded wait,
+    /// generalised here to one bounded wait per triggered lookup. Results
+    /// are collected later by [`Self::drain_enrichment`], never blocking
+    /// this call or the event loop that calls it.
+    pub fn resolve_checked(&mut self) {
+        let Some(sample) = self.current.as_ref().and_then(|s| s.connections.as_ref()) else {
+            return;
+        };
+
+        let targets: Vec<IpAddr> = sample
+            .connections
+            .iter()
+            .filter(|c| self.connections_checked.contains(&ConnKey::of(c)))
+            .map(|c| c.remote_addr)
+            .collect();
+
+        for addr in targets {
+            // Skip anything already in flight or already resolved; a
+            // `NotRequested`/`Failed`/absent entry is fair game (a
+            // `Failed` lookup is deliberately retriable — pressing `Enter`
+            // again on a still-checked row is the retry mechanism, there's
+            // no separate "retry" key).
+            let in_flight_or_done = matches!(
+                self.enrichment.get(&addr).map(|e| &e.domains),
+                Some(EnrichState::Pending) | Some(EnrichState::Done(_))
+            );
+            if in_flight_or_done {
+                continue;
+            }
+
+            self.enrichment.entry(addr).or_default().domains = EnrichState::Pending;
+
+            // A fresh reader, not a shared one: `SysfsReader` is `Clone`
+            // (cheap — a `PathBuf` and a few `usize`s) precisely so a
+            // background thread can own one outright rather than needing
+            // `Arc`/`Mutex` around the one `App`/`Registry` already holds.
+            let Ok(reader) = SysfsReader::with_root(self.config.sysfs_root.clone()) else {
+                continue;
+            };
+            let tx = self.enrichment_tx.clone();
+            thread::spawn(move || {
+                let result = crate::net_probe::dns::resolve_ptr(&reader, addr);
+                let _ = tx.send(EnrichmentUpdate::Domains(addr, result));
+            });
+        }
+    }
+
+    /// Fold in any enrichment results that have arrived since the last
+    /// call. Non-blocking (`try_recv`), cheap enough to call every
+    /// event-loop iteration.
+    pub fn drain_enrichment(&mut self) {
+        while let Ok(update) = self.enrichment_rx.try_recv() {
+            match update {
+                EnrichmentUpdate::Domains(addr, result) => {
+                    let entry = self.enrichment.entry(addr).or_default();
+                    entry.domains = match result {
+                        Some(domains) => EnrichState::Done(domains),
+                        None => EnrichState::Failed,
+                    };
+                }
+            }
+        }
     }
 
     /// Handle a terminal resize.
@@ -297,15 +494,16 @@ mod tests {
     }
 
     #[test]
-    fn from_digit_covers_one_through_six_and_nothing_else() {
+    fn from_digit_covers_one_through_seven_and_nothing_else() {
         assert_eq!(Panel::from_digit('1'), Some(Panel::Cpu));
         assert_eq!(Panel::from_digit('2'), Some(Panel::Memory));
         assert_eq!(Panel::from_digit('3'), Some(Panel::Thermal));
         assert_eq!(Panel::from_digit('4'), Some(Panel::Disk));
         assert_eq!(Panel::from_digit('5'), Some(Panel::Net));
         assert_eq!(Panel::from_digit('6'), Some(Panel::Gpu));
+        assert_eq!(Panel::from_digit('7'), Some(Panel::Connections));
         assert_eq!(Panel::from_digit('0'), None);
-        assert_eq!(Panel::from_digit('7'), None);
+        assert_eq!(Panel::from_digit('8'), None);
         assert_eq!(Panel::from_digit('a'), None);
     }
 
@@ -452,5 +650,151 @@ mod tests {
 
         assert!(app.current.is_some());
         assert!(app.history.len() <= 2, "history grew past history_len: {}", app.history.len());
+    }
+
+    // ---- connections panel: cursor, checkbox, enrichment -----------------------
+
+    fn fake_connection(remote_port: u16) -> Connection {
+        Connection {
+            protocol: ConnProtocol::Tcp,
+            local_addr: "10.0.0.1".parse().unwrap(),
+            local_port: 5000,
+            remote_addr: "8.8.8.8".parse().unwrap(),
+            remote_port,
+            state: Some(crate::sample::TcpState::Established),
+            uid: 1000,
+            pid: None,
+            program: None,
+        }
+    }
+
+    fn app_with_connections(conns: Vec<Connection>) -> App {
+        let mut app = App::new(test_config()).expect("constructs");
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample { connections: conns });
+        app.current = Some(snapshot);
+        app
+    }
+
+    #[test]
+    fn connections_cursor_wraps_in_both_directions() {
+        let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2), fake_connection(3)]);
+        app.focus = Panel::Connections;
+
+        app.on_key(KeyPress::Up).unwrap();
+        assert_eq!(app.connections_cursor, 2, "moving up from 0 must wrap to the last row");
+        app.on_key(KeyPress::Down).unwrap();
+        assert_eq!(app.connections_cursor, 0);
+        app.on_key(KeyPress::Down).unwrap();
+        assert_eq!(app.connections_cursor, 1);
+    }
+
+    #[test]
+    fn cursor_movement_is_ignored_outside_the_connections_panel() {
+        let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2)]);
+        // focus stays at its default (Overview).
+        app.on_key(KeyPress::Down).unwrap();
+        assert_eq!(app.connections_cursor, 0, "Up/Down must be inert outside the connections panel");
+    }
+
+    #[test]
+    fn x_toggles_the_cursor_rows_checkbox() {
+        let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2)]);
+        app.focus = Panel::Connections;
+        let key0 = ConnKey::of(&fake_connection(1));
+
+        app.on_key(KeyPress::Char('x')).unwrap();
+        assert!(app.connections_checked.contains(&key0));
+        app.on_key(KeyPress::Char('x')).unwrap();
+        assert!(!app.connections_checked.contains(&key0), "toggled again, must uncheck");
+    }
+
+    #[test]
+    fn x_is_ignored_outside_the_connections_panel() {
+        let mut app = app_with_connections(vec![fake_connection(1)]);
+        app.on_key(KeyPress::Char('x')).unwrap();
+        assert!(app.connections_checked.is_empty());
+    }
+
+    #[test]
+    fn resolve_checked_with_nothing_checked_spawns_nothing() {
+        let mut app = app_with_connections(vec![fake_connection(1)]);
+        app.resolve_checked();
+        assert!(app.enrichment.is_empty());
+    }
+
+    /// `resolve_checked` spawns a background thread per checked row's IP;
+    /// `drain_enrichment` picks up its result once it lands. `test_config`
+    /// points `sysfs_root` at a plain temp dir with no `etc/resolv.conf`,
+    /// so the lookup fails immediately with no real network I/O — keeping
+    /// this test fast and deterministic rather than depending on outside
+    /// network access.
+    #[test]
+    fn resolve_checked_marks_pending_then_drains_to_a_final_state() {
+        let mut app = app_with_connections(vec![fake_connection(1)]);
+        app.focus = Panel::Connections;
+        app.on_key(KeyPress::Char('x')).unwrap(); // check the only row
+
+        app.resolve_checked();
+        let addr: IpAddr = "8.8.8.8".parse().unwrap();
+        assert_eq!(
+            app.enrichment.get(&addr).map(|e| &e.domains),
+            Some(&EnrichState::Pending)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.drain_enrichment();
+            if !matches!(app.enrichment.get(&addr).map(|e| &e.domains), Some(EnrichState::Pending)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "enrichment never resolved");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            app.enrichment.get(&addr).map(|e| &e.domains),
+            Some(&EnrichState::Failed),
+            "no etc/resolv.conf under the test root, so this lookup must fail, not hang"
+        );
+    }
+
+    #[test]
+    fn resolve_checked_does_not_respawn_a_pending_or_done_lookup() {
+        let mut app = app_with_connections(vec![fake_connection(1)]);
+        let addr: IpAddr = "8.8.8.8".parse().unwrap();
+        app.enrichment.entry(addr).or_default().domains = EnrichState::Done(vec!["example.com".to_string()]);
+        app.focus = Panel::Connections;
+        app.on_key(KeyPress::Char('x')).unwrap();
+
+        app.resolve_checked();
+        // Must still be exactly the `Done` value set above, not reset to
+        // `Pending` by a redundant spawn.
+        assert_eq!(
+            app.enrichment.get(&addr).map(|e| &e.domains),
+            Some(&EnrichState::Done(vec!["example.com".to_string()]))
+        );
+    }
+
+    #[test]
+    fn clamp_connections_cursor_pulls_the_cursor_back_when_the_list_shrinks() {
+        let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2), fake_connection(3)]);
+        app.connections_cursor = 2;
+
+        app.current.as_mut().unwrap().connections = Some(crate::sample::ConnectionSample {
+            connections: vec![fake_connection(1)],
+        });
+        app.clamp_connections_cursor();
+        assert_eq!(app.connections_cursor, 0);
+    }
+
+    #[test]
+    fn clamp_connections_cursor_resets_to_zero_when_the_list_becomes_empty() {
+        let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2)]);
+        app.connections_cursor = 1;
+
+        app.current.as_mut().unwrap().connections = Some(crate::sample::ConnectionSample { connections: vec![] });
+        app.clamp_connections_cursor();
+        assert_eq!(app.connections_cursor, 0);
     }
 }

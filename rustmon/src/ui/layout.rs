@@ -33,6 +33,7 @@ pub struct Layout {
     pub disk: Option<Rect>,
     pub net: Option<Rect>,
     pub gpu: Option<Rect>,
+    pub connections: Option<Rect>,
     pub footer: Option<Rect>,
 }
 
@@ -43,6 +44,7 @@ pub struct PanelPresence {
     pub disk: bool,
     pub net: bool,
     pub gpu: bool,
+    pub connections: bool,
 }
 
 const NARROW_WIDTH: u16 = 60;
@@ -81,9 +83,11 @@ pub fn compute(width: u16, height: u16, presence: PanelPresence) -> Layout {
 
     // Most important first — also the drop order below, popped from the
     // end under row pressure. CPU and memory never drop: every machine this
-    // crate targets has both. GPU is dropped first among the rest: it's the
-    // newest panel and the least universally applicable (plenty of machines
-    // have none at all), so it's the natural first thing to sacrifice.
+    // crate targets has both. GPU and connections are dropped first among
+    // the rest: GPU is the least universally applicable panel (plenty of
+    // machines have none at all), and connections is opt-in enrichment
+    // territory rather than core hardware telemetry, so it's the single
+    // most natural thing to sacrifice under row pressure — appended last.
     let mut wanted: Vec<&'static str> = vec!["cpu", "memory"];
     if !narrow {
         if presence.thermal {
@@ -97,6 +101,9 @@ pub fn compute(width: u16, height: u16, presence: PanelPresence) -> Layout {
         }
         if presence.gpu {
             wanted.push("gpu");
+        }
+        if presence.connections {
+            wanted.push("connections");
         }
     }
 
@@ -160,7 +167,8 @@ pub fn compute(width: u16, height: u16, presence: PanelPresence) -> Layout {
                 "disk" => layout.disk = Some(rect),
                 "net" => layout.net = Some(rect),
                 "gpu" => layout.gpu = Some(rect),
-                _ => unreachable!("wanted only ever contains the six names matched above"),
+                "connections" => layout.connections = Some(rect),
+                _ => unreachable!("wanted only ever contains the names matched above"),
             }
         }
     }
@@ -248,6 +256,7 @@ mod tests {
             disk: true,
             net: true,
             gpu: true,
+            connections: true,
         }
     }
 
@@ -262,6 +271,7 @@ mod tests {
             layout.disk,
             layout.net,
             layout.gpu,
+            layout.connections,
             layout.footer,
         ]
         .into_iter()
@@ -289,6 +299,7 @@ mod tests {
         assert!(layout.disk.is_none());
         assert!(layout.net.is_none());
         assert!(layout.gpu.is_none());
+        assert!(layout.connections.is_none());
         assert_layout_is_valid(&layout, 40, 40);
     }
 
@@ -301,6 +312,7 @@ mod tests {
         assert!(layout.disk.is_some());
         assert!(layout.net.is_some());
         assert!(layout.gpu.is_some());
+        assert!(layout.connections.is_some());
         assert_layout_is_valid(&layout, 90, 40);
     }
 
@@ -313,6 +325,7 @@ mod tests {
         assert!(layout.disk.is_none());
         assert!(layout.net.is_none());
         assert!(layout.gpu.is_none());
+        assert!(layout.connections.is_none());
     }
 
     #[test]

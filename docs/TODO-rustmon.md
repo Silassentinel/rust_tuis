@@ -827,17 +827,60 @@ sign-off; the other five are not.
          preference for hand-rolled logic over relying on less-certain
          standard-library surface.
 
-- [ ] **15. DNS resolution + the connections panel checkbox/cursor UX.**
-      Hand-rolled UDP PTR-query client (`net_probe/dns.rs`, reads
-      `/etc/resolv.conf` via the existing `SysfsReader`, zero new
-      dependency — transparently benefits from `unbound` or any other
-      locally-configured resolver). `App`-side `enrichment: HashMap<IpAddr,
-      Enrichment>` cache + background-thread-per-lookup pattern (same
-      thread+channel shape as chunk 8's `read_capacity`). New
-      `Panel::Connections` (7th panel, appended so `1`-`6` stay exactly as
-      tested), `Up`/`Down` to move a row cursor, `x` to toggle a checkbox,
-      `Enter` to trigger DNS (and, once chunk 17 lands, traceroute) for
-      every checked row's remote IP.
+- [x] **15. DNS resolution + the connections panel checkbox/cursor UX.**
+      *(done 2026-08-13)* Hand-rolled UDP PTR-query client
+      (`net_probe/dns.rs`, reads `/etc/resolv.conf` via the existing
+      `SysfsReader`, zero new dependency — transparently benefits from
+      `unbound` or any other locally-configured resolver). `App`-side
+      `enrichment: HashMap<IpAddr, Enrichment>` cache +
+      background-thread-per-lookup pattern (same thread+channel shape as
+      chunk 8's `read_capacity`). New `Panel::Connections` (7th panel,
+      appended so `1`-`6` stay exactly as tested), `Up`/`Down` to move a row
+      cursor, `x` to toggle a checkbox, `Enter` to trigger DNS (and, once
+      chunk 17 lands, traceroute) for every checked row's remote IP.
+
+      36 new tests (371 in the crate: 363 unit + 8 integration), plus two
+      rounds of real-world verification. The DNS client itself: resolved
+      `8.8.8.8`→`dns.google` and `1.1.1.1`→`one.one.one.one` — both
+      genuinely correct — in ~16ms round trips against this machine's real
+      configured resolver, with the full RFC 1035 compression-pointer
+      decoder exercised for real (not just the hand-built fixture in the
+      unit tests). The checkbox/cursor UX: driven through a real pty
+      session (the same technique chunk 9 used) against this machine's
+      actual open connections — `7` focused the panel, `x` checked a row,
+      `Enter` triggered resolution, and the panel correctly transitioned
+      from `resolving...` to `no PTR record` once the real (genuinely
+      NXDOMAIN) answer for `160.79.104.10` landed, with the result
+      correctly applied to every other row sharing that same remote IP —
+      exactly the point of keying `enrichment` by IP rather than by
+      connection. Clean exit and terminal restore confirmed as usual.
+
+      Decisions worth knowing about:
+
+      1. **Enrichment is keyed by remote IP, not by connection**, and this
+         was directly proven live, not just asserted: this machine had a
+         dozen-plus separate `claude` connections all talking to the same
+         `160.79.104.10`, and checking + resolving just one of them
+         populated the domain for every other row sharing that address —
+         the real-world case the design was built for, not a hypothetical.
+      2. **`Enrichment`'s `EnrichState` distinguishes "queried and got
+         nothing" (`Done(vec![])`, rendered as `no PTR record`) from
+         "couldn't even ask" (`Failed`)** — an `RCODE` like `NXDOMAIN` is a
+         complete, successful answer that happens to say "nothing here,"
+         a materially different fact from a timeout or an unconfigured
+         resolver, and the UI says which one happened rather than
+         collapsing both into one generic "failed" state.
+      3. **A `Failed` lookup is retriable by design, with no separate retry
+         key.** `resolve_checked` only skips IPs already `Pending`/`Done` —
+         a `Failed` (or never-requested) entry is fair game, so pressing
+         `Enter` again on a still-checked row is the retry mechanism.
+      4. **`connections_cursor` is clamped in a dedicated
+         `clamp_connections_cursor` method, split out from `refresh` itself**
+         specifically so the clamp-on-shrink behaviour is unit-testable
+         without needing a real collector round trip to shrink the list —
+         connections are the only panel whose backing list can plausibly
+         shrink between refreshes (a socket closing), so this is new
+         territory none of the other six panels needed.
 
 - [ ] **16. Crate-checklist proposal for chunk 17.** 🔒 Not a new crate — a
       feature addition to the already-approved `nix` (add `socket` to the

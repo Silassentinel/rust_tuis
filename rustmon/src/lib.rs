@@ -52,6 +52,8 @@ pub mod sysfs;
 pub mod units;
 
 #[cfg(feature = "tui")]
+pub mod net_probe;
+#[cfg(feature = "tui")]
 pub mod ui;
 
 pub use config::Config;

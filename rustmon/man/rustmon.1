@@ -92,8 +92,9 @@ Quit.
 .B Tab, Shift\-Tab
 Cycle panel focus.
 .TP
-.B 1\-6
-Jump directly to a panel (CPU, memory, thermal, disk, net, GPU).
+.B 1\-7
+Jump directly to a panel (CPU, memory, thermal, disk, net, GPU,
+connections).
 .TP
 .B space
 Pause/resume the refresh loop.
@@ -107,6 +108,26 @@ Toggle the help overlay.
 .TP
 \fB+\fR, \fB\-\fR
 Adjust the refresh interval (floor: 100ms).
+.PP
+With the connections panel focused:
+.TP
+.B Up, Down
+Move the row cursor.
+.TP
+.B x
+Toggle the cursor row's checkbox.
+.TP
+.B Enter
+Resolve every checked row's remote IP to a domain name (a hand\-rolled
+reverse\-DNS lookup, cached per IP \(em checking one connection resolves
+every other connection sharing that address too). Best\-effort: shows
+.I resolving...
+while pending,
+.I "no PTR record"
+if the query succeeded but found nothing, or
+.I failed
+on a timeout or an unreachable/unconfigured resolver. Never triggered
+automatically \(em only on request, for exactly the rows you check.
 .SH SUMMARY MODE
 .B rustmon \-\-summary
 is built for a shell prompt (e.g. an oh\-my\-posh command segment): it must

@@ -14,6 +14,8 @@
 //! `Snapshot`, so every `FanSensor` this module sees is a real reading, and
 //! `0` there is a fact worth showing, not an absence to hide.
 
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Layout as RLayout, Rect as RRect};
@@ -23,7 +25,8 @@ use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph, Row, Spar
 use ratatui::Frame;
 
 use crate::delta::Rates;
-use crate::sample::{Snapshot, TempSeverity};
+use crate::sample::{ConnProtocol, Snapshot, TempSeverity};
+use crate::ui::app::{ConnKey, EnrichState, Enrichment};
 use crate::ui::layout::Rect;
 use crate::units::Percent;
 
@@ -401,7 +404,79 @@ pub fn draw_gpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
     }
 }
 
-const HELP_HINT: &str = "q quit  Tab next  1-6 jump  space pause  r reset  ? help  +/- interval";
+/// Per-process internet-facing connections: a checkbox and cursor-
+/// highlighted row per connection, program/PID (or `uid` when
+/// unattributable), protocol, endpoints, and — once resolved — domain
+/// name(s).
+///
+/// Unlike every other panel, this one needs interactive state
+/// (`cursor`/`checked`) and background-lookup results (`enrichment`) that
+/// don't live on `Snapshot` at all — see `ui::app`'s own doc for why domain
+/// resolution is cached there, keyed by remote IP, rather than being part
+/// of the collector's pure data model.
+pub fn draw_connections(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &Snapshot,
+    cursor: usize,
+    checked: &HashSet<ConnKey>,
+    enrichment: &HashMap<IpAddr, Enrichment>,
+) {
+    let outer = to_ratatui(area);
+    let block = Block::bordered().title("Connections");
+    let inner = block.inner(outer);
+    frame.render_widget(block, outer);
+
+    let Some(sample) = &snapshot.connections else {
+        frame.render_widget(Paragraph::new("no connection data"), inner);
+        return;
+    };
+
+    if sample.connections.is_empty() {
+        frame.render_widget(Paragraph::new("no internet-facing connections"), inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = sample
+        .connections
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| {
+            let checkbox = if checked.contains(&ConnKey::of(c)) { "[x]" } else { "[ ]" };
+            let owner = match (&c.program, c.pid) {
+                (Some(program), Some(pid)) => format!("{program}[{pid}]"),
+                _ => format!("uid {}", c.uid),
+            };
+            let protocol = match c.protocol {
+                ConnProtocol::Tcp => "tcp",
+                ConnProtocol::Udp => "udp",
+            };
+            let domain = match enrichment.get(&c.remote_addr).map(|e| &e.domains) {
+                None | Some(EnrichState::NotRequested) => "—".to_string(),
+                Some(EnrichState::Pending) => "resolving…".to_string(),
+                Some(EnrichState::Done(domains)) if domains.is_empty() => "no PTR record".to_string(),
+                Some(EnrichState::Done(domains)) => domains.join(", "),
+                Some(EnrichState::Failed) => "failed".to_string(),
+            };
+
+            let line = format!(
+                "{checkbox} {:<20} {protocol} {}:{} -> {}:{}  {domain}",
+                owner, c.local_addr, c.local_port, c.remote_addr, c.remote_port
+            );
+
+            let style = if idx == cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(line, style)))
+        })
+        .collect();
+
+    frame.render_widget(List::new(items), inner);
+}
+
+const HELP_HINT: &str = "q quit  Tab next  1-7 jump  space pause  r reset  ? help  +/- interval";
 
 /// Key hints, and collector errors when `--verbose`.
 ///
@@ -440,11 +515,16 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
     let text = [
         "q / Esc        quit",
         "Tab / S-Tab    cycle panels",
-        "1-6            jump to a panel",
+        "1-7            jump to a panel",
         "space          pause",
         "r              reset the rate tracker",
         "?              toggle this help",
         "+ / -          adjust the refresh interval",
+        "",
+        "In the Connections panel:",
+        "Up / Down      move the row cursor",
+        "x              toggle the cursor row's checkbox",
+        "Enter          resolve every checked row's domain",
     ]
     .join("\n");
     frame.render_widget(Paragraph::new(text), inner);
@@ -738,6 +818,105 @@ mod tests {
         assert!(text.contains("card1"), "{text}");
     }
 
+    // ---- draw_connections ---------------------------------------------------------
+
+    fn fake_connection(remote_port: u16) -> crate::sample::Connection {
+        crate::sample::Connection {
+            protocol: ConnProtocol::Tcp,
+            local_addr: "10.0.0.1".parse().unwrap(),
+            local_port: 5000,
+            remote_addr: "8.8.8.8".parse().unwrap(),
+            remote_port,
+            state: Some(crate::sample::TcpState::Established),
+            uid: 1000,
+            pid: Some(42),
+            program: Some("curl".to_string()),
+        }
+    }
+
+    #[test]
+    fn connections_panel_with_no_data_does_not_panic() {
+        let snapshot = Snapshot::now();
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+        });
+        assert!(text.contains("no connection data"), "{text}");
+    }
+
+    #[test]
+    fn connections_panel_with_an_empty_list_says_so_not_a_blank_panel() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![] });
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+        });
+        assert!(text.contains("no internet-facing connections"), "{text}");
+    }
+
+    #[test]
+    fn connections_panel_shows_owner_and_endpoints() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample {
+            connections: vec![fake_connection(443)],
+        });
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+        });
+        assert!(text.contains("curl[42]"), "{text}");
+        assert!(text.contains("8.8.8.8:443"), "{text}");
+    }
+
+    #[test]
+    fn connections_panel_marks_checked_rows() {
+        let mut snapshot = Snapshot::now();
+        let conn = fake_connection(443);
+        let key = ConnKey::of(&conn);
+        snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![conn] });
+
+        let mut checked = HashSet::new();
+        checked.insert(key);
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, 0, &checked, &HashMap::new());
+        });
+        assert!(text.contains("[x]"), "{text}");
+        assert!(!text.contains("[ ]"), "unchecked marker should not appear: {text}");
+    }
+
+    #[test]
+    fn connections_panel_shows_domain_resolution_states() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample {
+            connections: vec![fake_connection(443)],
+        });
+        let addr: IpAddr = "8.8.8.8".parse().unwrap();
+
+        for (state, expected) in [
+            (EnrichState::Pending, "resolving"),
+            (EnrichState::Done(vec!["dns.google".to_string()]), "dns.google"),
+            (EnrichState::Done(vec![]), "no PTR record"),
+            (EnrichState::Failed, "failed"),
+        ] {
+            let mut enrichment = HashMap::new();
+            enrichment.insert(addr, Enrichment { domains: state });
+            let text = render_to_text(80, 10, |frame| {
+                draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &enrichment);
+            });
+            assert!(text.contains(expected), "expected {expected:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_not_yet_requested_connection_shows_an_em_dash_not_a_blank() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections = Some(crate::sample::ConnectionSample {
+            connections: vec![fake_connection(443)],
+        });
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+        });
+        assert!(text.contains('—'), "expected an em-dash for unresolved domain: {text}");
+    }
+
     // ---- draw_footer ------------------------------------------------------------
 
     #[test]
@@ -781,10 +960,13 @@ mod tests {
 
     #[test]
     fn help_overlay_lists_every_documented_key() {
-        let text = render_to_text(60, 12, |frame| {
-            draw_help(frame, full_area(60, 12));
+        let text = render_to_text(60, 16, |frame| {
+            draw_help(frame, full_area(60, 16));
         });
-        for key in ["quit", "cycle panels", "pause", "reset", "help", "interval"] {
+        for key in [
+            "quit", "cycle panels", "pause", "reset", "help", "interval",
+            "row cursor", "checkbox", "resolve",
+        ] {
             assert!(text.contains(key), "missing {key:?} in help text: {text}");
         }
     }
