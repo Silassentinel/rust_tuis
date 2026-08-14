@@ -322,6 +322,10 @@ pub fn write(out: &mut dyn Write, snapshot: &Snapshot, rates: Option<&Rates>, ve
                 w.key("program")?;
                 w.str_value(program)?;
             }
+            if let Some(ppid) = c.ppid {
+                w.key("ppid")?;
+                w.u64_value(u64::from(ppid))?;
+            }
             w.end_object()?;
         }
         w.end_array()?;
@@ -985,6 +989,7 @@ mod tests {
                 uid: 1000,
                 pid: Some(42),
                 program: Some("curl".to_string()),
+                ppid: Some(7),
             }],
         });
 
@@ -1026,7 +1031,7 @@ mod tests {
             "\"thermal\"", "\"disk\"", "\"mounts\"", "\"net\"", "\"gpu\"",
             "\"read_bytes_per_sec\":100", "\"rx_bytes_per_sec\":10",
             "\"vendor\":\"amd\"", "\"connections\"", "\"remote_addr\":\"8.8.8.8\"",
-            "\"program\":\"curl\"",
+            "\"program\":\"curl\"", "\"ppid\":7",
         ] {
             assert!(text.contains(expected), "missing {expected} in {text}");
         }

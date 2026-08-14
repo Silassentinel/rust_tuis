@@ -155,8 +155,8 @@ fn draw_frame(frame: &mut Frame, app: &App) {
             frame,
             rect,
             snapshot,
+            &app.connections_rows(),
             app.connections_cursor,
-            &app.connections_checked,
             &app.enrichment,
         );
     }

@@ -980,6 +980,139 @@ sign-off; the other five are not.
 
 ---
 
+## Second phase, continued: connections panel process tree
+
+- [x] **Chunk 18: connections panel — process tree (parent/child grouping +
+      collapse), plus two small bugs found while testing the built
+      binary.** Testing the just-shipped chunks 12–17 against the real
+      binary surfaced two real problems: `draw_connections` rendered with a
+      plain `render_widget(List::new(items), ...)` and no `ListState`, so
+      ratatui always drew from the top and clipped anything past the
+      panel's height — moving the cursor past the visible rows highlighted
+      a row you couldn't see; and `--version`'s feature list never checked
+      `traceroute`, an omission from chunk 17. Both fixed
+      (`ui/widgets.rs`'s `draw_connections` now uses
+      `render_stateful_widget` with a `ListState` selecting the cursor
+      index every frame; `cli.rs::version_text` now checks
+      `cfg!(feature = "traceroute")` too). With scrolling fixed, the full
+      connections list became visible — long, because one real process was
+      opening many concurrent connections to the same host (an HTTP/2
+      connection pool). Not literal duplicate rows (checked: zero exact
+      `protocol+local+remote` duplicates in a live 62-connection snapshot)
+      but visually repetitive enough to ask for a collapsible process tree.
+      Two design questions were resolved with the user via
+      `AskUserQuestion` before writing code: group by real OS parent/child
+      relationship (not name-matching), and checking a collapsed group's
+      checkbox bulk-checks its entire subtree.
+
+      Implementation: `Connection` gained a `ppid: Option<u32>` field
+      (`sample.rs`), populated by a new `read_parent_pid` in
+      `collectors/connections.rs` reading `proc/<pid>/status`'s `PPid:`
+      line — same fail-soft story and same trust tier as the existing
+      `pid`/`program` reads, no new privilege. `ui/app.rs` gained the tree
+      machinery: `ProcNode`/`build_forest` groups connections by pid and
+      links a pid to its parent only when that parent *also* owns a
+      filtered connection (an internet-connected process whose parent
+      isn't also internet-connected becomes its own root, not nested under
+      a synthetic placeholder); `ConnRow`/`flatten_forest` produces the
+      actual display/cursor row list, with `checked`/`collapsed` computed
+      once there rather than re-derived by `draw_connections` (which now
+      only renders what it's given). `connections_cursor` now indexes into
+      this flattened row list instead of the raw connection array;
+      `toggle_checked` branches on the cursor row — a `Connection` row
+      toggles one `ConnKey` as before, a `Process` row does an
+      all-or-nothing bulk toggle over its whole subtree (via new
+      `subtree_indices`/`find_node` helpers), regardless of any nested
+      process's own collapse state. New `Left`/`Right` keybindings
+      (previously-unbound `KeyPress` variants) collapse/expand the cursor
+      row's process group. `resolve_checked` needed no changes at all — it
+      already just filters by `connections_checked.contains(...)`, which
+      works identically no matter how those keys got checked.
+
+      Tests: `read_parent_pid` unit tests (happy path, missing file,
+      malformed value, missing field) plus updated `collect()` end-to-end
+      fixtures proving `ppid` round-trips through the real collector; a
+      dedicated `ui::app` test section covering flat unattributed rows,
+      single-process grouping, real parent/child nesting, "parent doesn't
+      own a connection so child becomes its own root", collapse hiding a
+      whole subtree, expand restoring it, Left/Right being no-ops on a
+      `Connection` row, bulk check/uncheck over a subtree, and — the one
+      genuinely tricky case — a synthetic two-pid `ppid` cycle proven to
+      terminate with both connections still visible rather than hanging or
+      silently dropping data. `ui::widgets` tests rebuilt around
+      hand-constructed `ConnRow` fixtures (since `draw_connections` no
+      longer builds the tree itself) covering process-header rendering,
+      collapse markers, nested vs. top-level connection rows, and every
+      existing checkbox/domain/route rendering test carried forward.
+      390 unit tests + 8 integration tests in the default build (up from
+      374 + 8 after chunk 17), 379 unit tests with `tui` and no
+      `traceroute`, 282 unit tests with `--no-default-features` — all
+      three configurations clean under `cargo clippy --all-targets` too.
+
+      Real-hardware verification: `rustmon`'s own `ppid` output for this
+      machine's live connections was cross-checked against
+      `ps -eo pid,ppid,comm` and matched exactly for every attributed pid.
+      A real pty session (this time reconstructed through `pyte`'s screen
+      emulator rather than raw substring search on ANSI-interleaved output
+      — a naive `"text" in raw_bytes` check false-negatived on strings
+      ratatui had legitimately split across cursor-positioning escape
+      sequences) confirmed: the tree renders grouped correctly; `Left`
+      collapses a process row and its connections disappear from view;
+      `Right` restores them; `x` on a collapsed header checks every
+      connection in its subtree even though none of them are currently
+      drawn; `Enter` then resolves all of them, and — a nice confirmation
+      that this composes correctly with chunk 15's existing per-IP
+      enrichment cache — connections in *other*, unchecked groups sharing
+      the same remote IP picked up the resolved domain too, with no extra
+      code needed for that to happen. Clean exit and terminal restore
+      confirmed. Route tracing still correctly showed `unavailable` (no
+      `CAP_NET_RAW` granted to this build).
+
+      Decisions worth knowing about:
+
+      1. **Only a direct parent/child link nests a process, not the full
+         OS ancestry chain.** The connections collector only ever walks
+         `/proc/<pid>` for processes that themselves own a filtered
+         connection (established back in chunk 14, for cost reasons) — so
+         if an internet-connected process's immediate parent isn't itself
+         internet-connected, there's no real ancestor in this dataset to
+         nest it under, and it becomes its own root rather than nesting
+         under a synthetic placeholder pid the user never asked to see.
+         Verified this is the common case on this actual machine right
+         now: several real parent/child pairs exist, but at snapshot time
+         none of the immediate parents happened to hold a socket
+         themselves, so real nesting is currently proven only by the
+         synthetic unit test fixtures, not by this session's live pty
+         capture — worth knowing if a future session wants to eyeball real
+         nesting, not a gap in the feature itself.
+      2. **Cycle safety was designed in, not bolted on after a hang.**
+         Nothing about a real OS process tree can cycle, but nothing
+         guarantees the *two separate* `/proc` reads behind a connection's
+         `pid` and `ppid` stay consistent with each other (pid reuse
+         mid-refresh, in principle) — `build_forest` tracks a `visited`
+         set during its top-down walk and appends any never-reached pid as
+         its own extra root afterward, so a cycle can neither hang the tree
+         build nor silently drop a connection from the view. Covered by a
+         dedicated test constructing a real two-pid mutual cycle.
+      3. **The connections-panel tree is rebuilt from scratch on every
+         cursor move, checkbox toggle, and collapse toggle — not cached.**
+         At most a few hundred connections and a couple dozen distinct
+         pids, cheap enough that caching would have been premature
+         complexity, and rebuilding-on-demand means the row list, cursor
+         position, and checkbox/collapse state can never drift out of sync
+         with each other, which a cached-and-invalidated version would have
+         had to get right by construction instead.
+      4. **`draw_connections` no longer builds any tree structure itself**
+         — it takes a pre-flattened `&[ConnRow]` (with `checked`/
+         `collapsed` already resolved) and only renders. This is a bigger
+         signature change than it looks (dropped the `checked:
+         &HashSet<ConnKey>` parameter entirely), but keeps the
+         "collectors/app resolve, widgets draw" split this crate has used
+         since chunk 9 intact rather than letting rendering code start
+         making structural decisions.
+
+---
+
 ## Cross-cutting rules for every chunk
 
 - No `unwrap`/`expect`/panic in library code — the security model depends on it.

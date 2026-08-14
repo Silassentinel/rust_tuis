@@ -427,6 +427,7 @@ mod tests {
                     uid: 1000,
                     pid: Some(42),
                     program: Some("curl".to_string()),
+                    ppid: Some(7),
                 },
                 crate::sample::Connection {
                     protocol: crate::sample::ConnProtocol::Udp,
@@ -438,6 +439,7 @@ mod tests {
                     uid: 1001,
                     pid: None,
                     program: None,
+                    ppid: None,
                 },
             ],
         });

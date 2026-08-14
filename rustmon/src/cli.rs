@@ -194,8 +194,9 @@ absent rather than as an error.
 }
 
 /// `rustmon <version>` plus which optional features this build has compiled in
-/// (`tui`, `gpu-nvidia`, `fs-capacity`) — worth printing, because "why is my
-/// NVIDIA GPU missing" is answered by that line.
+/// (`tui`, `gpu-nvidia`, `fs-capacity`, `traceroute`) — worth printing,
+/// because "why is my NVIDIA GPU missing" / "why does route tracing say
+/// unavailable" is answered by that line.
 pub fn version_text() -> String {
     let mut features = Vec::new();
     if cfg!(feature = "tui") {
@@ -206,6 +207,9 @@ pub fn version_text() -> String {
     }
     if cfg!(feature = "fs-capacity") {
         features.push("fs-capacity");
+    }
+    if cfg!(feature = "traceroute") {
+        features.push("traceroute");
     }
 
     let feature_list = if features.is_empty() {
@@ -416,6 +420,9 @@ mod tests {
         let text = version_text();
         if cfg!(feature = "tui") {
             assert!(text.contains("tui"), "{text}");
+        }
+        if cfg!(feature = "traceroute") {
+            assert!(text.contains("traceroute"), "{text}");
         }
         if !cfg!(feature = "gpu-nvidia") {
             assert!(!text.contains("gpu-nvidia"), "{text}");

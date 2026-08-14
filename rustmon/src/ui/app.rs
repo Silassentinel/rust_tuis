@@ -120,6 +120,211 @@ impl ConnKey {
     }
 }
 
+/// One visible row in the connections panel's process tree — either a
+/// process's own header (grouping its direct connections and any nested
+/// subprocesses) or one actual connection, at some indentation `depth`.
+/// `checked`/`collapsed` are computed once, here, rather than re-derived by
+/// [`crate::ui::widgets::draw_connections`] — that function only renders
+/// what it's given, matching this crate's existing "collectors resolve,
+/// widgets draw" split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnRow {
+    Process {
+        pid: u32,
+        program: Option<String>,
+        depth: usize,
+        collapsed: bool,
+        /// `true` only if every connection in this process's entire
+        /// subtree (its own connections plus every descendant process's)
+        /// is checked — an all-or-nothing summary, not a tri-state.
+        checked: bool,
+        own_connections: usize,
+        subprocesses: usize,
+    },
+    Connection {
+        /// Index into the current snapshot's `connections.connections`.
+        index: usize,
+        depth: usize,
+        checked: bool,
+    },
+}
+
+impl ConnRow {
+    pub fn depth(&self) -> usize {
+        match self {
+            ConnRow::Process { depth, .. } | ConnRow::Connection { depth, .. } => *depth,
+        }
+    }
+}
+
+/// One process in the connections-panel tree: its own directly-owned
+/// connections (by index into the flat connection list) plus any nested
+/// subprocess nodes. Built fresh from the current snapshot each time it's
+/// needed (see [`App::connections_rows`]) rather than cached — cheap enough
+/// (at most a few hundred connections, a couple dozen distinct pids) that
+/// caching would be premature.
+struct ProcNode {
+    pid: u32,
+    program: Option<String>,
+    own_indices: Vec<usize>,
+    children: Vec<ProcNode>,
+}
+
+/// Group `connections` into a forest of [`ProcNode`]s plus a flat list of
+/// indices for connections with no attributed `pid` at all (shown
+/// ungrouped, as today).
+///
+/// A pid is a root if its `ppid` is `None` or isn't itself a pid present in
+/// this connection set — this crate's connections collector only walks
+/// `/proc/<pid>` for processes that themselves own a filtered connection
+/// (see `collectors::connections`' own doc for why), so an
+/// internet-connected process whose parent isn't *also* internet-connected
+/// has no real ancestor to nest under here; it becomes its own root rather
+/// than nesting under a synthetic placeholder.
+///
+/// Cycle-safe by construction even though a real OS process tree can never
+/// actually cycle: nothing guarantees the two separate `/proc` reads behind
+/// `pid` and `ppid` are perfectly consistent with each other (a pid could
+/// be reused by a new, unrelated process between them). A `visited` set
+/// ensures no pid is ever descended into twice; any pid a plain root-down
+/// walk never reaches (only possible if two pids' `ppid`s point at each
+/// other) is appended as its own extra root afterward, so a cycle can
+/// neither hang this function nor silently drop connections from the view
+/// — it just gets broken at an arbitrary point.
+fn build_forest(connections: &[Connection]) -> (Vec<ProcNode>, Vec<usize>) {
+    let mut by_pid: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut ppid_of: HashMap<u32, Option<u32>> = HashMap::new();
+    let mut program_of: HashMap<u32, Option<String>> = HashMap::new();
+    let mut unattributed: Vec<usize> = Vec::new();
+
+    for (index, c) in connections.iter().enumerate() {
+        match c.pid {
+            Some(pid) => {
+                by_pid.entry(pid).or_default().push(index);
+                ppid_of.entry(pid).or_insert(c.ppid);
+                program_of.entry(pid).or_insert_with(|| c.program.clone());
+            }
+            None => unattributed.push(index),
+        }
+    }
+
+    let mut all_pids: Vec<u32> = by_pid.keys().copied().collect();
+    all_pids.sort_unstable();
+
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut roots: Vec<u32> = Vec::new();
+    for &pid in &all_pids {
+        match ppid_of.get(&pid).copied().flatten() {
+            Some(ppid) if by_pid.contains_key(&ppid) => children_of.entry(ppid).or_default().push(pid),
+            _ => roots.push(pid),
+        }
+    }
+    for kids in children_of.values_mut() {
+        kids.sort_unstable();
+    }
+
+    fn build_node(
+        pid: u32,
+        by_pid: &HashMap<u32, Vec<usize>>,
+        program_of: &HashMap<u32, Option<String>>,
+        children_of: &HashMap<u32, Vec<u32>>,
+        visited: &mut HashSet<u32>,
+    ) -> ProcNode {
+        visited.insert(pid);
+        let own_indices = by_pid.get(&pid).cloned().unwrap_or_default();
+        let program = program_of.get(&pid).cloned().flatten();
+        let mut children = Vec::new();
+        if let Some(child_pids) = children_of.get(&pid) {
+            for &child in child_pids {
+                if !visited.contains(&child) {
+                    children.push(build_node(child, by_pid, program_of, children_of, visited));
+                }
+            }
+        }
+        ProcNode { pid, program, own_indices, children }
+    }
+
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut result: Vec<ProcNode> = Vec::new();
+    for &pid in &roots {
+        if !visited.contains(&pid) {
+            result.push(build_node(pid, &by_pid, &program_of, &children_of, &mut visited));
+        }
+    }
+    // Cycle fallback: any pid a normal root-down walk never reached.
+    for &pid in &all_pids {
+        if !visited.contains(&pid) {
+            result.push(build_node(pid, &by_pid, &program_of, &children_of, &mut visited));
+        }
+    }
+
+    (result, unattributed)
+}
+
+/// Every connection index in `node`'s subtree — its own plus every nested
+/// child process's, regardless of that child's collapse state. Used for
+/// bulk-checking a whole process group at once (see [`App::toggle_checked`]):
+/// collapsing is purely visual, so it must never shrink what a bulk check
+/// reaches.
+fn subtree_indices(node: &ProcNode, out: &mut Vec<usize>) {
+    out.extend_from_slice(&node.own_indices);
+    for child in &node.children {
+        subtree_indices(child, out);
+    }
+}
+
+fn find_node(nodes: &[ProcNode], pid: u32) -> Option<&ProcNode> {
+    for node in nodes {
+        if node.pid == pid {
+            return Some(node);
+        }
+        if let Some(found) = find_node(&node.children, pid) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Flatten a forest into the display/cursor row list, skipping a
+/// collapsed process's entire subtree (that's what makes collapsing
+/// actually shrink the visible list).
+fn flatten_forest(
+    nodes: &[ProcNode],
+    depth: usize,
+    collapsed: &HashSet<u32>,
+    connections: &[Connection],
+    checked: &HashSet<ConnKey>,
+    out: &mut Vec<ConnRow>,
+) {
+    for node in nodes {
+        let mut subtree = Vec::new();
+        subtree_indices(node, &mut subtree);
+        let all_checked = !subtree.is_empty()
+            && subtree
+                .iter()
+                .all(|&i| connections.get(i).is_some_and(|c| checked.contains(&ConnKey::of(c))));
+        let is_collapsed = collapsed.contains(&node.pid);
+
+        out.push(ConnRow::Process {
+            pid: node.pid,
+            program: node.program.clone(),
+            depth,
+            collapsed: is_collapsed,
+            checked: all_checked,
+            own_connections: node.own_indices.len(),
+            subprocesses: node.children.len(),
+        });
+
+        if !is_collapsed {
+            for &index in &node.own_indices {
+                let row_checked = connections.get(index).is_some_and(|c| checked.contains(&ConnKey::of(c)));
+                out.push(ConnRow::Connection { index, depth: depth + 1, checked: row_checked });
+            }
+            flatten_forest(&node.children, depth + 1, collapsed, connections, checked, out);
+        }
+    }
+}
+
 /// Resolution state for one field of one remote IP's enrichment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EnrichState<T> {
@@ -197,6 +402,9 @@ pub struct App {
     /// Which rows are checkbox-marked for enrichment, keyed by row
     /// identity rather than index — see [`ConnKey`].
     pub connections_checked: HashSet<ConnKey>,
+    /// Which process-tree nodes are collapsed, keyed by pid — a pid not in
+    /// this set is expanded (the default), so the tree starts fully open.
+    pub connections_collapsed: HashSet<u32>,
     /// DNS (and, once traceroute lands, route) results, keyed by remote IP.
     pub enrichment: HashMap<IpAddr, Enrichment>,
     enrichment_tx: mpsc::Sender<EnrichmentUpdate>,
@@ -236,6 +444,7 @@ impl App {
             kernel,
             connections_cursor: 0,
             connections_checked: HashSet::new(),
+            connections_collapsed: HashSet::new(),
             enrichment: HashMap::new(),
             enrichment_tx,
             enrichment_rx,
@@ -265,12 +474,13 @@ impl App {
     }
 
     /// The connection list is ephemeral (sockets open and close every
-    /// refresh), so the cursor can end up past the end of a shorter list —
-    /// clamp it here (called from [`Self::refresh`]) rather than at every
-    /// read site. Split out from `refresh` so it's directly testable
-    /// without needing a real collector round trip to shrink the list.
+    /// refresh), and collapsing/expanding a process group changes the
+    /// visible row count without a new snapshot — either can leave the
+    /// cursor past the end of a shorter row list, so this clamps it. Called
+    /// from [`Self::refresh`] and from [`Self::collapse_cursor_row`]/
+    /// [`Self::expand_cursor_row`] rather than at every read site.
     fn clamp_connections_cursor(&mut self) {
-        let Some(len) = self.connections_len() else { return };
+        let len = self.connections_rows().len();
         self.connections_cursor = if len == 0 { 0 } else { self.connections_cursor.min(len - 1) };
     }
 
@@ -280,8 +490,10 @@ impl App {
     /// to a panel, `space` pause, `r` reset the rate tracker, `?` help,
     /// `+`/`-` adjust the interval (clamped to [`crate::config::MIN_INTERVAL`]).
     /// With the connections panel focused: `Up`/`Down` move the row cursor,
-    /// `x` toggles the cursor row's checkbox, `Enter` resolves every
-    /// checked row's remote IP (see [`Self::resolve_checked`]).
+    /// `x` toggles the cursor row's checkbox (a process row toggles every
+    /// connection in its whole subtree at once), `Left`/`Right`
+    /// collapse/expand the cursor row's process group, `Enter` resolves
+    /// every checked row's remote IP (see [`Self::resolve_checked`]).
     pub fn on_key(&mut self, key: KeyPress) -> Result<()> {
         match key {
             KeyPress::CtrlC | KeyPress::Esc => self.should_quit = true,
@@ -289,6 +501,8 @@ impl App {
             KeyPress::BackTab => self.focus = self.focus.prev(),
             KeyPress::Up if self.focus == Panel::Connections => self.move_connections_cursor(-1),
             KeyPress::Down if self.focus == Panel::Connections => self.move_connections_cursor(1),
+            KeyPress::Left if self.focus == Panel::Connections => self.collapse_cursor_row(),
+            KeyPress::Right if self.focus == Panel::Connections => self.expand_cursor_row(),
             KeyPress::Enter if self.focus == Panel::Connections => self.resolve_checked(),
             KeyPress::Char(c) => match c {
                 'q' => self.should_quit = true,
@@ -321,7 +535,7 @@ impl App {
     /// Move the connections-panel row cursor by `delta`, wrapping — a no-op
     /// if there's no connection data (or none) to move a cursor over.
     fn move_connections_cursor(&mut self, delta: isize) {
-        let Some(len) = self.connections_len() else { return };
+        let len = self.connections_rows().len();
         if len == 0 {
             self.connections_cursor = 0;
             return;
@@ -330,24 +544,85 @@ impl App {
         self.connections_cursor = next as usize;
     }
 
-    /// Toggle the cursor row's checkbox.
+    /// Toggle the cursor row's checkbox. On a [`ConnRow::Connection`] this
+    /// toggles just that one connection, same as always. On a
+    /// [`ConnRow::Process`] this is a bulk, all-or-nothing toggle over its
+    /// *entire* subtree (own connections plus every nested subprocess's,
+    /// regardless of their own collapse state — collapsing only affects
+    /// what's drawn, never what a bulk check reaches): if every connection
+    /// in the subtree is already checked, uncheck them all; otherwise check
+    /// them all.
     fn toggle_checked(&mut self) {
-        let Some(conn) = self
-            .current
-            .as_ref()
-            .and_then(|s| s.connections.as_ref())
-            .and_then(|c| c.connections.get(self.connections_cursor))
-        else {
-            return;
-        };
-        let key = ConnKey::of(conn);
-        if !self.connections_checked.remove(&key) {
-            self.connections_checked.insert(key);
+        let rows = self.connections_rows();
+        let Some(row) = rows.get(self.connections_cursor) else { return };
+        let Some(sample) = self.current.as_ref().and_then(|s| s.connections.as_ref()) else { return };
+
+        match row {
+            ConnRow::Connection { index, .. } => {
+                let Some(conn) = sample.connections.get(*index) else { return };
+                let key = ConnKey::of(conn);
+                if !self.connections_checked.remove(&key) {
+                    self.connections_checked.insert(key);
+                }
+            }
+            ConnRow::Process { pid, .. } => {
+                let (roots, _) = build_forest(&sample.connections);
+                let Some(node) = find_node(&roots, *pid) else { return };
+                let mut indices = Vec::new();
+                subtree_indices(node, &mut indices);
+                let keys: Vec<ConnKey> =
+                    indices.iter().filter_map(|&i| sample.connections.get(i)).map(ConnKey::of).collect();
+                let all_checked = !keys.is_empty() && keys.iter().all(|k| self.connections_checked.contains(k));
+                for k in keys {
+                    if all_checked {
+                        self.connections_checked.remove(&k);
+                    } else {
+                        self.connections_checked.insert(k);
+                    }
+                }
+            }
         }
     }
 
-    fn connections_len(&self) -> Option<usize> {
-        self.current.as_ref().and_then(|s| s.connections.as_ref()).map(|c| c.connections.len())
+    /// Collapse the cursor row's process group — a no-op on a `Connection`
+    /// row or a row that isn't currently the cursor's.
+    fn collapse_cursor_row(&mut self) {
+        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.connections_cursor) {
+            self.connections_collapsed.insert(*pid);
+        }
+        self.clamp_connections_cursor();
+    }
+
+    /// Expand the cursor row's process group.
+    fn expand_cursor_row(&mut self) {
+        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.connections_cursor) {
+            self.connections_collapsed.remove(pid);
+        }
+        self.clamp_connections_cursor();
+    }
+
+    /// The connections panel's current process tree, flattened into display
+    /// rows — see [`ConnRow`], [`build_forest`], and [`flatten_forest`].
+    /// Rebuilt on demand rather than cached: at most a few hundred
+    /// connections and a couple dozen distinct pids, cheap enough that
+    /// caching would be premature, and this keeps the row list, cursor
+    /// position, and checkbox/collapse state trivially always in sync.
+    pub fn connections_rows(&self) -> Vec<ConnRow> {
+        let Some(sample) = self.current.as_ref().and_then(|s| s.connections.as_ref()) else {
+            return Vec::new();
+        };
+
+        let (roots, unattributed) = build_forest(&sample.connections);
+        let mut rows = Vec::new();
+        flatten_forest(&roots, 0, &self.connections_collapsed, &sample.connections, &self.connections_checked, &mut rows);
+        for index in unattributed {
+            let checked = sample
+                .connections
+                .get(index)
+                .is_some_and(|c| self.connections_checked.contains(&ConnKey::of(c)));
+            rows.push(ConnRow::Connection { index, depth: 0, checked });
+        }
+        rows
     }
 
     /// Kick off DNS resolution for every checked row's remote IP that isn't
@@ -716,6 +991,7 @@ mod tests {
             uid: 1000,
             pid: None,
             program: None,
+            ppid: None,
         }
     }
 
@@ -725,6 +1001,10 @@ mod tests {
         snapshot.connections = Some(crate::sample::ConnectionSample { connections: conns });
         app.current = Some(snapshot);
         app
+    }
+
+    fn fake_owned_connection(pid: u32, ppid: Option<u32>, program: &str, remote_port: u16) -> Connection {
+        Connection { pid: Some(pid), ppid, program: Some(program.to_string()), ..fake_connection(remote_port) }
     }
 
     #[test]
@@ -847,5 +1127,148 @@ mod tests {
         app.current.as_mut().unwrap().connections = Some(crate::sample::ConnectionSample { connections: vec![] });
         app.clamp_connections_cursor();
         assert_eq!(app.connections_cursor, 0);
+    }
+
+    // ---- connections panel: process tree ---------------------------------------
+
+    #[test]
+    fn an_unattributed_connection_is_a_flat_top_level_row() {
+        let app = app_with_connections(vec![fake_connection(1)]);
+        let rows = app.connections_rows();
+        assert_eq!(rows, vec![ConnRow::Connection { index: 0, depth: 0, checked: false }]);
+    }
+
+    #[test]
+    fn a_pid_owned_connection_is_grouped_under_a_process_header() {
+        let app = app_with_connections(vec![fake_owned_connection(42, None, "curl", 1)]);
+        let rows = app.connections_rows();
+        assert_eq!(
+            rows,
+            vec![
+                ConnRow::Process {
+                    pid: 42,
+                    program: Some("curl".to_string()),
+                    depth: 0,
+                    collapsed: false,
+                    checked: false,
+                    own_connections: 1,
+                    subprocesses: 0,
+                },
+                ConnRow::Connection { index: 0, depth: 1, checked: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_process_nests_under_its_real_parent() {
+        // pid 100 is the parent (no ppid of its own here); pid 200's ppid
+        // points at 100, and 100 owns a connection too — matching a real
+        // Electron-style main-process-plus-renderer shape.
+        let app = app_with_connections(vec![
+            fake_owned_connection(100, None, "app", 1),
+            fake_owned_connection(200, Some(100), "app", 2),
+        ]);
+        let rows = app.connections_rows();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(matches!(rows[0], ConnRow::Process { pid: 100, depth: 0, .. }), "{rows:?}");
+        assert!(matches!(rows[1], ConnRow::Connection { index: 0, depth: 1, .. }), "{rows:?}");
+        assert!(matches!(rows[2], ConnRow::Process { pid: 200, depth: 1, .. }), "{rows:?}");
+        assert!(matches!(rows[3], ConnRow::Connection { index: 1, depth: 2, .. }), "{rows:?}");
+    }
+
+    #[test]
+    fn a_process_whose_parent_owns_no_connection_becomes_its_own_root() {
+        // pid 200's ppid (999) never owns a filtered connection itself, so
+        // there's nothing real to nest 200 under — it's a root, not nested
+        // under a synthetic placeholder.
+        let app = app_with_connections(vec![fake_owned_connection(200, Some(999), "app", 1)]);
+        let rows = app.connections_rows();
+        assert!(matches!(rows[0], ConnRow::Process { pid: 200, depth: 0, .. }), "{rows:?}");
+    }
+
+    #[test]
+    fn collapsing_a_process_hides_its_entire_subtree() {
+        let mut app = app_with_connections(vec![
+            fake_owned_connection(100, None, "app", 1),
+            fake_owned_connection(200, Some(100), "app", 2),
+        ]);
+        app.focus = Panel::Connections;
+        assert_eq!(app.connections_rows().len(), 4);
+
+        app.connections_cursor = 0; // the pid-100 header
+        app.on_key(KeyPress::Left).unwrap();
+        let rows = app.connections_rows();
+        assert_eq!(rows, vec![ConnRow::Process {
+            pid: 100,
+            program: Some("app".to_string()),
+            depth: 0,
+            collapsed: true,
+            checked: false,
+            own_connections: 1,
+            subprocesses: 1,
+        }]);
+    }
+
+    #[test]
+    fn expanding_a_collapsed_process_restores_its_subtree() {
+        let mut app = app_with_connections(vec![fake_owned_connection(42, None, "curl", 1)]);
+        app.focus = Panel::Connections;
+        app.connections_collapsed.insert(42);
+        assert_eq!(app.connections_rows().len(), 1, "collapsed: header only");
+
+        app.connections_cursor = 0;
+        app.on_key(KeyPress::Right).unwrap();
+        assert_eq!(app.connections_rows().len(), 2, "expanded: header + its connection");
+    }
+
+    #[test]
+    fn left_and_right_are_no_ops_on_a_connection_row() {
+        let mut app = app_with_connections(vec![fake_connection(1)]);
+        app.focus = Panel::Connections;
+        app.connections_cursor = 0; // the only row, a flat unattributed Connection
+        app.on_key(KeyPress::Left).unwrap();
+        app.on_key(KeyPress::Right).unwrap();
+        assert!(app.connections_collapsed.is_empty());
+    }
+
+    #[test]
+    fn checking_a_process_header_checks_its_entire_subtree() {
+        let mut app = app_with_connections(vec![
+            fake_owned_connection(100, None, "app", 1),
+            fake_owned_connection(200, Some(100), "app", 2),
+        ]);
+        app.focus = Panel::Connections;
+        app.connections_cursor = 0; // the pid-100 header, whose subtree includes pid 200
+
+        app.on_key(KeyPress::Char('x')).unwrap();
+        assert_eq!(app.connections_checked.len(), 2, "both connections in the subtree must be checked");
+
+        // Toggling the (now fully-checked) header again must uncheck the
+        // whole subtree, not check it further.
+        app.on_key(KeyPress::Char('x')).unwrap();
+        assert!(app.connections_checked.is_empty());
+    }
+
+    #[test]
+    fn build_forest_is_cycle_safe() {
+        // A ppid cycle can't happen in a real OS process tree, but nothing
+        // guarantees the two separate `/proc` reads behind `pid`/`ppid`
+        // stay consistent with each other (e.g. pid reuse mid-refresh) —
+        // this must terminate and keep both connections visible rather
+        // than hang or silently drop them.
+        let app = app_with_connections(vec![
+            fake_owned_connection(10, Some(20), "a", 1),
+            fake_owned_connection(20, Some(10), "b", 2),
+        ]);
+        let rows = app.connections_rows();
+        assert_eq!(rows.len(), 4, "2 process headers + 2 connections: {rows:?}");
+        let seen_indices: HashSet<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ConnRow::Connection { index, .. } => Some(*index),
+                ConnRow::Process { .. } => None,
+            })
+            .collect();
+        assert_eq!(seen_indices, HashSet::from([0, 1]), "every connection must still appear exactly once");
     }
 }

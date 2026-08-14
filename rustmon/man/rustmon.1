@@ -109,13 +109,27 @@ Toggle the help overlay.
 \fB+\fR, \fB\-\fR
 Adjust the refresh interval (floor: 100ms).
 .PP
-With the connections panel focused:
+With the connections panel focused, connections are grouped into a
+collapsible tree by real OS parent/child process relationship (each
+process's
+.I PPid
+from
+.IR /proc/<pid>/status ):
 .TP
 .B Up, Down
 Move the row cursor.
 .TP
 .B x
-Toggle the cursor row's checkbox.
+Toggle the cursor row's checkbox. On a process\-header row this checks or
+unchecks every connection in that process's entire subtree at once \(em
+its own connections plus every nested subprocess's \(em so
+.B Enter
+can resolve a whole group without expanding it first.
+.TP
+.B Left, Right
+Collapse or expand the cursor row's process group. Collapsing only
+changes what's drawn; a bulk checkbox toggle on a collapsed row still
+reaches every connection underneath it.
 .TP
 .B Enter
 Resolve every checked row's remote IP: a domain name (a hand\-rolled

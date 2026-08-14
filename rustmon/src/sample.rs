@@ -412,6 +412,12 @@ pub struct Connection {
     pub pid: Option<u32>,
     /// `/proc/<pid>/comm`, sanitised. `None` exactly when `pid` is `None`.
     pub program: Option<String>,
+    /// The owning process's parent pid, from `/proc/<pid>/status`'s `PPid`
+    /// field — used by the connections panel to group subprocesses under
+    /// their parent. `None` exactly when `pid` is `None` (nothing to read
+    /// a parent for), or if that read itself failed (same fail-soft story
+    /// as `program`).
+    pub ppid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -101,10 +101,10 @@ impl Collector for ConnectionsCollector {
         let connections = raw
             .into_iter()
             .map(|(protocol, entry)| {
-                let (pid, program) = owners
+                let (pid, program, ppid) = owners
                     .get(&entry.inode)
                     .cloned()
-                    .unwrap_or((None, None));
+                    .unwrap_or((None, None, None));
                 Connection {
                     protocol,
                     local_addr: entry.local_addr,
@@ -118,6 +118,7 @@ impl Collector for ConnectionsCollector {
                     uid: entry.uid,
                     pid,
                     program,
+                    ppid,
                 }
             })
             .collect();
@@ -287,11 +288,14 @@ pub fn is_public_ip(addr: &IpAddr) -> bool {
     }
 }
 
-/// Correlate socket inodes to (pid, program name), stopping as soon as
-/// every inode in `needed` has been matched. See this module's own doc for
-/// why this doesn't just walk every process's every fd unconditionally.
-fn resolve_owners(reader: &SysfsReader, needed: &HashSet<u64>) -> HashMap<u64, (Option<u32>, Option<String>)> {
-    let mut found: HashMap<u64, (Option<u32>, Option<String>)> = HashMap::new();
+/// Correlate socket inodes to (pid, program name, parent pid), stopping as
+/// soon as every inode in `needed` has been matched. See this module's own
+/// doc for why this doesn't just walk every process's every fd
+/// unconditionally.
+type Owner = (Option<u32>, Option<String>, Option<u32>);
+
+fn resolve_owners(reader: &SysfsReader, needed: &HashSet<u64>) -> HashMap<u64, Owner> {
+    let mut found: HashMap<u64, Owner> = HashMap::new();
     if needed.is_empty() {
         return found;
     }
@@ -335,9 +339,10 @@ fn resolve_owners(reader: &SysfsReader, needed: &HashSet<u64>) -> HashMap<u64, (
         }
 
         let program = read_program_name(reader, &pid_str);
+        let ppid = read_parent_pid(reader, &pid_str);
         for inode in matched_this_pid {
             remaining.remove(&inode);
-            found.insert(inode, (Some(pid), program.clone()));
+            found.insert(inode, (Some(pid), program.clone(), ppid));
         }
     }
 
@@ -361,6 +366,22 @@ fn read_program_name(reader: &SysfsReader, pid: &str) -> Option<String> {
         Ok(Ok(name)) => Some(sanitize_kernel_string(&name, MAX_PROGRAM_NAME_LEN)),
         _ => None,
     }
+}
+
+/// The owning process's parent pid, from `proc/<pid>/status`'s `PPid:`
+/// line — used by the UI to group subprocesses under their parent. Fails
+/// soft to `None` (unreadable file, missing `PPid:` line, or a non-numeric
+/// value) exactly like `read_program_name` does for `comm`.
+fn read_parent_pid(reader: &SysfsReader, pid: &str) -> Option<u32> {
+    let path = format!("proc/{pid}/status");
+    let contents = match reader.read_to_string(Path::new(&path)) {
+        Ok(Ok(s)) => s,
+        _ => return None,
+    };
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|rest| rest.trim().parse().ok())
 }
 
 #[cfg(test)]
@@ -548,9 +569,38 @@ mod tests {
         assert_eq!(parse_socket_inode("anon_inode:[eventfd]"), None);
     }
 
-    // ---- end-to-end: collect() against a fixture tree ---------------------------
+    // ---- read_parent_pid ---------------------------------------------------------
 
     use crate::sysfs::tests::TempTree;
+
+    #[test]
+    fn read_parent_pid_finds_the_ppid_line() {
+        let tree = TempTree::new("read-parent-pid-happy");
+        tree.file("proc/99/status", "Name:\tsh\nState:\tS\nPPid:\t1\nUid:\t0\t0\t0\t0\n");
+        assert_eq!(read_parent_pid(&tree.reader(), "99"), Some(1));
+    }
+
+    #[test]
+    fn read_parent_pid_is_none_when_status_is_missing() {
+        let tree = TempTree::new("read-parent-pid-missing");
+        assert_eq!(read_parent_pid(&tree.reader(), "99"), None);
+    }
+
+    #[test]
+    fn read_parent_pid_is_none_when_the_ppid_line_is_malformed() {
+        let tree = TempTree::new("read-parent-pid-malformed");
+        tree.file("proc/99/status", "Name:\tsh\nPPid:\tnot-a-number\n");
+        assert_eq!(read_parent_pid(&tree.reader(), "99"), None);
+    }
+
+    #[test]
+    fn read_parent_pid_is_none_when_there_is_no_ppid_line_at_all() {
+        let tree = TempTree::new("read-parent-pid-absent-field");
+        tree.file("proc/99/status", "Name:\tsh\nState:\tS\n");
+        assert_eq!(read_parent_pid(&tree.reader(), "99"), None);
+    }
+
+    // ---- end-to-end: collect() against a fixture tree ---------------------------
 
     fn tcp_header() -> &'static str {
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
@@ -574,6 +624,7 @@ mod tests {
         tree.dir("proc/42/fd");
         tree.symlink("proc/42/fd/3", Path::new("socket:[999999]"));
         tree.file("proc/42/comm", "curl\n");
+        tree.file("proc/42/status", "Name:\tcurl\nState:\tS (sleeping)\nPPid:\t7\nUid:\t1000\t1000\t1000\t1000\n");
 
         let reader = tree.reader();
         let mut collector = ConnectionsCollector::new();
@@ -587,7 +638,35 @@ mod tests {
         assert_eq!(conn.remote_port, 443);
         assert_eq!(conn.pid, Some(42));
         assert_eq!(conn.program.as_deref(), Some("curl"));
+        assert_eq!(conn.ppid, Some(7));
         assert_eq!(conn.uid, 1000);
+    }
+
+    /// No `proc/<pid>/status` file at all (present `comm`, absent `status`)
+    /// — attribution still succeeds via `comm`, `ppid` just comes back
+    /// `None`, same fail-soft story `program` already has independently of
+    /// `pid`.
+    #[test]
+    fn collect_leaves_ppid_none_when_status_is_unreadable() {
+        let tree = TempTree::new("connections-e2e-no-status");
+        let tcp = format!(
+            "{}   0: 0A00A8C0:C71C 08080808:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 999999 1\n",
+            tcp_header()
+        );
+        tree.file("proc/net/tcp", &tcp);
+        tree.dir("proc/42/fd");
+        tree.symlink("proc/42/fd/3", Path::new("socket:[999999]"));
+        tree.file("proc/42/comm", "curl\n");
+        // No `proc/42/status` at all.
+
+        let reader = tree.reader();
+        let mut collector = ConnectionsCollector::new();
+        let mut snapshot = Snapshot::now();
+        collector.collect(&reader, &mut snapshot).expect("collect must not fail");
+
+        let sample = snapshot.connections.expect("connections present");
+        assert_eq!(sample.connections[0].pid, Some(42));
+        assert_eq!(sample.connections[0].ppid, None);
     }
 
     /// A connection whose owning process can't be walked (no matching

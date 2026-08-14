@@ -4,10 +4,11 @@ A read-only hardware monitor for Linux. Part of the [`rust_tuis`](../README.md)
 collection.
 
 > **Status: the live TUI, `--once`, and `--summary` all work and are fully
-> tested — including per-connection DNS resolution and route tracing.** 374
-> unit tests + 8 end-to-end tests against the compiled binary in the default
-> build, all green (also verified at 361 unit tests with `tui` and no
-> `traceroute` feature, and 277 unit tests with `--no-default-features`).
+> tested — including per-connection DNS resolution, route tracing, and a
+> process-tree connections panel.** 390 unit tests + 8 end-to-end tests
+> against the compiled binary in the default build, all green (also
+> verified at 379 unit tests with `tui` and no `traceroute` feature, and
+> 282 unit tests with `--no-default-features`).
 > `rustmon`, `rustmon --once`, `rustmon --once --format json`, and
 > `rustmon --summary` are all real, working commands — run for real against
 > this machine and verified, not just unit-tested: the JSON was piped
@@ -25,13 +26,19 @@ collection.
 > checkbox/DNS resolution driven live through a real pty against this
 > machine's actual connections — resolving a genuinely NXDOMAIN remote IP
 > correctly showed `no PTR record`, applied across every one of the
-> dozen-plus connections sharing that address**. Route tracing (raw ICMP,
-> `CAP_NET_RAW`-gated) is covered by unit tests including a genuinely
-> unprivileged fail-soft run (`unavailable`, no crash) and a real-pty check
-> of the `tracing…` → `unavailable` state transition; a real privileged
-> trace against live network hops was attempted but blocked in this sandbox
-> by `sudo` requiring an interactive password — a known verification gap,
-> noted here rather than glossed over. NVIDIA GPU support was declined
+> dozen-plus connections sharing that address**. The process-tree grouping
+> was verified against this machine's real process table too — every
+> connection's `ppid` matched `ps -eo pid,ppid,comm` exactly, and a real
+> pty session confirmed collapsing a process hid its whole subtree,
+> expanding restored it, and checking a collapsed group's checkbox bulk-
+> checked every connection underneath (confirmed by then resolving them
+> all with one `Enter`). Route tracing (raw ICMP, `CAP_NET_RAW`-gated) is
+> covered by unit tests including a genuinely unprivileged fail-soft run
+> (`unavailable`, no crash) and a real-pty check of the `tracing…` →
+> `unavailable` state transition; a real privileged trace against live
+> network hops was attempted but blocked in this sandbox by `sudo`
+> requiring an interactive password — a known verification gap, noted
+> here rather than glossed over. NVIDIA GPU support was declined
 > (chunk 10's remainder, `nvml-wrapper`) — no NVIDIA hardware on the target
 > machine; AMD/Intel GPU support is unaffected. The original 11-chunk build
 > plan is complete; a second phase (man page, `--summary`, connection
@@ -68,12 +75,17 @@ no internet-facing connections) are omitted entirely, not shown empty.
 | `?` | Toggle the help overlay |
 | `+` / `-` | Adjust the refresh interval (floor: 100 ms) |
 
+Connections are grouped into a collapsible tree by real OS parent/child
+process relationship (each process's `PPid` from `/proc/<pid>/status`), so
+a process pool of a dozen connections collapses to one line.
+
 With the connections panel focused:
 
 | Key | Does |
 |---|---|
 | `Up` / `Down` | Move the row cursor |
-| `x` | Toggle the cursor row's checkbox |
+| `x` | Toggle the cursor row's checkbox — on a process-header row, checks/unchecks its *entire* subtree at once |
+| `Left` / `Right` | Collapse / expand the cursor row's process group (visual only — a bulk checkbox toggle still reaches every connection underneath) |
 | `Enter` | Resolve every checked row's remote IP to a domain name, and (on builds with the `traceroute` feature) a route |
 
 Domain resolution is a hand-rolled reverse-DNS (PTR) client over
@@ -252,9 +264,11 @@ figures) — the TUI has no JSON export of its own, and this schema stays a
       "state": "established",                // TCP only — absent for udp
       "uid": 1000,                           // always present, even when pid/program aren't
       "pid": 10791,                          // absent if the owning process couldn't be
-      "program": "claude-desktop"            // read (a different user's process — EACCES)
-    }
-  ],
+      "program": "claude-desktop",           // read (a different user's process — EACCES)
+      "ppid": 6621                           // parent pid, from /proc/<pid>/status — used
+    }                                        // by the TUI's process-tree grouping; absent
+  ],                                         // exactly when pid is absent too
+
 
   "errors": [                                // only with --verbose
     { "collector": "gpu", "message": "..." } // which collector failed, and why

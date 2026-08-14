@@ -14,19 +14,19 @@
 //! `Snapshot`, so every `FanSensor` this module sees is a real reading, and
 //! `0` there is a fact worth showing, not an absence to hide.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Layout as RLayout, Rect as RRect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use crate::delta::Rates;
 use crate::sample::{ConnProtocol, Snapshot, TempSeverity};
-use crate::ui::app::{ConnKey, EnrichState, Enrichment};
+use crate::ui::app::{ConnRow, EnrichState, Enrichment};
 use crate::ui::layout::Rect;
 use crate::units::Percent;
 
@@ -404,22 +404,23 @@ pub fn draw_gpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
     }
 }
 
-/// Per-process internet-facing connections: a checkbox and cursor-
-/// highlighted row per connection, program/PID (or `uid` when
-/// unattributable), protocol, endpoints, and — once resolved — domain
-/// name(s).
+/// Per-process internet-facing connections, as a collapsible process tree:
+/// a checkbox and cursor-highlighted row per process group or connection,
+/// indented under its parent process, protocol, endpoints, and — once
+/// resolved — domain name(s) and (with the `traceroute` feature) route.
 ///
-/// Unlike every other panel, this one needs interactive state
-/// (`cursor`/`checked`) and background-lookup results (`enrichment`) that
-/// don't live on `Snapshot` at all — see `ui::app`'s own doc for why domain
-/// resolution is cached there, keyed by remote IP, rather than being part
-/// of the collector's pure data model.
+/// Unlike every other panel, this one needs interactive state (`rows`,
+/// `cursor`) and background-lookup results (`enrichment`) that don't live
+/// on `Snapshot` at all — `rows` is `App::connections_rows()`'s flattened
+/// tree, computed there (not here) so this function stays pure rendering:
+/// it never re-derives tree structure, checkbox state, or collapse state,
+/// it only draws what each [`ConnRow`] already says.
 pub fn draw_connections(
     frame: &mut Frame,
     area: Rect,
     snapshot: &Snapshot,
+    rows: &[ConnRow],
     cursor: usize,
-    checked: &HashSet<ConnKey>,
     enrichment: &HashMap<IpAddr, Enrichment>,
 ) {
     let outer = to_ratatui(area);
@@ -437,37 +438,63 @@ pub fn draw_connections(
         return;
     }
 
-    let items: Vec<ListItem> = sample
-        .connections
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(idx, c)| {
-            let checkbox = if checked.contains(&ConnKey::of(c)) { "[x]" } else { "[ ]" };
-            let owner = match (&c.program, c.pid) {
-                (Some(program), Some(pid)) => format!("{program}[{pid}]"),
-                _ => format!("uid {}", c.uid),
-            };
-            let protocol = match c.protocol {
-                ConnProtocol::Tcp => "tcp",
-                ConnProtocol::Udp => "udp",
-            };
-            let domain = match enrichment.get(&c.remote_addr).map(|e| &e.domains) {
-                None | Some(EnrichState::NotRequested) => "—".to_string(),
-                Some(EnrichState::Pending) => "resolving…".to_string(),
-                Some(EnrichState::Done(domains)) if domains.is_empty() => "no PTR record".to_string(),
-                Some(EnrichState::Done(domains)) => domains.join(", "),
-                Some(EnrichState::Failed) => "failed".to_string(),
-            };
+        .map(|(idx, row)| {
+            let indent = "  ".repeat(row.depth());
+            let line = match row {
+                ConnRow::Process { pid, program, collapsed, checked, own_connections, subprocesses, .. } => {
+                    let marker = if *collapsed { "▸" } else { "▾" };
+                    let checkbox = if *checked { "[x]" } else { "[ ]" };
+                    let name = program.as_deref().unwrap_or("?");
+                    let subs = if *subprocesses > 0 {
+                        format!(", {subprocesses} subprocess{}", if *subprocesses == 1 { "" } else { "es" })
+                    } else {
+                        String::new()
+                    };
+                    let conns = if *own_connections == 1 { "connection" } else { "connections" };
+                    format!("{indent}{marker} {checkbox} {name}[{pid}]  ({own_connections} {conns}{subs})")
+                }
+                ConnRow::Connection { index, depth, checked } => {
+                    let Some(c) = sample.connections.get(*index) else { return ListItem::new("") };
+                    let checkbox = if *checked { "[x]" } else { "[ ]" };
+                    let protocol = match c.protocol {
+                        ConnProtocol::Tcp => "tcp",
+                        ConnProtocol::Udp => "udp",
+                    };
+                    let domain = match enrichment.get(&c.remote_addr).map(|e| &e.domains) {
+                        None | Some(EnrichState::NotRequested) => "—".to_string(),
+                        Some(EnrichState::Pending) => "resolving…".to_string(),
+                        Some(EnrichState::Done(domains)) if domains.is_empty() => "no PTR record".to_string(),
+                        Some(EnrichState::Done(domains)) => domains.join(", "),
+                        Some(EnrichState::Failed) => "failed".to_string(),
+                    };
 
-            #[cfg(feature = "traceroute")]
-            let route = format!("  route: {}", route_text(enrichment.get(&c.remote_addr)));
-            #[cfg(not(feature = "traceroute"))]
-            let route = String::new();
+                    #[cfg(feature = "traceroute")]
+                    let route = format!("  route: {}", route_text(enrichment.get(&c.remote_addr)));
+                    #[cfg(not(feature = "traceroute"))]
+                    let route = String::new();
 
-            let line = format!(
-                "{checkbox} {:<20} {protocol} {}:{} -> {}:{}  {domain}{route}",
-                owner, c.local_addr, c.local_port, c.remote_addr, c.remote_port
-            );
+                    // A connection nested under a process header (depth >
+                    // 0) doesn't repeat that header's owner; a top-level
+                    // unattributed connection (depth 0, no process row
+                    // above it) still shows its `uid`, same as before this
+                    // tree existed.
+                    if *depth == 0 {
+                        let owner = format!("uid {}", c.uid);
+                        format!(
+                            "{checkbox} {owner:<20} {protocol} {}:{} -> {}:{}  {domain}{route}",
+                            c.local_addr, c.local_port, c.remote_addr, c.remote_port
+                        )
+                    } else {
+                        format!(
+                            "{indent}{checkbox} {protocol} {}:{} -> {}:{}  {domain}{route}",
+                            c.local_addr, c.local_port, c.remote_addr, c.remote_port
+                        )
+                    }
+                }
+            };
 
             let style = if idx == cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -478,7 +505,15 @@ pub fn draw_connections(
         })
         .collect();
 
-    frame.render_widget(List::new(items), inner);
+    // A plain `render_widget(List::new(items), ...)` always draws from the
+    // top of the list and clips anything past the panel's height — moving
+    // `cursor` past the visible rows would highlight a row you can't see.
+    // Routing through `ListState` (even a fresh one every frame; `select`
+    // is all ratatui needs to compute a scroll offset that keeps the
+    // selected row in view) makes the cursor actually scroll the viewport.
+    let mut state = ListState::default();
+    state.select(Some(cursor));
+    frame.render_stateful_widget(List::new(items), inner, &mut state);
 }
 
 /// Render one connection's route state — `—` (never requested), `tracing…`
@@ -548,7 +583,8 @@ pub fn draw_help(frame: &mut Frame, area: Rect) {
         "",
         "In the Connections panel:",
         "Up / Down      move the row cursor",
-        "x              toggle the cursor row's checkbox",
+        "x              toggle the cursor row's checkbox (a process row toggles its whole subtree)",
+        "Left / Right   collapse / expand a subprocess group",
         "Enter          resolve every checked row's domain + route",
     ]
     .join("\n");
@@ -845,6 +881,11 @@ mod tests {
 
     // ---- draw_connections ---------------------------------------------------------
 
+    /// An attributed connection (owned by a process, pid 42) — grouped
+    /// under a [`ConnRow::Process`] header in a real tree, so a test using
+    /// this must supply that header row itself (see
+    /// `process_header_and_connection`); `draw_connections` no longer
+    /// builds the tree, it only draws the rows it's given.
     fn fake_connection(remote_port: u16) -> crate::sample::Connection {
         crate::sample::Connection {
             protocol: ConnProtocol::Tcp,
@@ -856,14 +897,40 @@ mod tests {
             uid: 1000,
             pid: Some(42),
             program: Some("curl".to_string()),
+            ppid: None,
         }
+    }
+
+    /// An unattributed connection (no owning process found) — a flat,
+    /// top-level `ConnRow::Connection` at depth 0 with no process header
+    /// above it, shown by its `uid` instead.
+    fn fake_unattributed_connection(remote_port: u16) -> crate::sample::Connection {
+        crate::sample::Connection { pid: None, program: None, ppid: None, ..fake_connection(remote_port) }
+    }
+
+    /// `[Process header, nested Connection]` rows for one attributed
+    /// connection at snapshot index 0 — what `App::connections_rows()`
+    /// would build for a single-connection, single-process tree.
+    fn process_header_and_connection(checked: bool) -> Vec<ConnRow> {
+        vec![
+            ConnRow::Process {
+                pid: 42,
+                program: Some("curl".to_string()),
+                depth: 0,
+                collapsed: false,
+                checked,
+                own_connections: 1,
+                subprocesses: 0,
+            },
+            ConnRow::Connection { index: 0, depth: 1, checked },
+        ]
     }
 
     #[test]
     fn connections_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(80, 10, |frame| {
-            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+            draw_connections(frame, full_area(80, 10), &snapshot, &[], 0, &HashMap::new());
         });
         assert!(text.contains("no connection data"), "{text}");
     }
@@ -873,46 +940,83 @@ mod tests {
         let mut snapshot = Snapshot::now();
         snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![] });
         let text = render_to_text(80, 10, |frame| {
-            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+            draw_connections(frame, full_area(80, 10), &snapshot, &[], 0, &HashMap::new());
         });
         assert!(text.contains("no internet-facing connections"), "{text}");
     }
 
     #[test]
-    fn connections_panel_shows_owner_and_endpoints() {
+    fn connections_panel_shows_a_process_header_and_its_nested_connection() {
         let mut snapshot = Snapshot::now();
-        snapshot.connections = Some(crate::sample::ConnectionSample {
-            connections: vec![fake_connection(443)],
-        });
+        snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![fake_connection(443)] });
+        let rows = process_header_and_connection(false);
         let text = render_to_text(80, 10, |frame| {
-            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+            draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &HashMap::new());
         });
         assert!(text.contains("curl[42]"), "{text}");
+        assert!(text.contains("(1 connection)"), "{text}");
+        assert!(text.contains("8.8.8.8:443"), "{text}");
+    }
+
+    #[test]
+    fn connections_panel_shows_an_unattributed_connection_by_its_uid() {
+        let mut snapshot = Snapshot::now();
+        snapshot.connections =
+            Some(crate::sample::ConnectionSample { connections: vec![fake_unattributed_connection(443)] });
+        let rows = [ConnRow::Connection { index: 0, depth: 0, checked: false }];
+        let text = render_to_text(80, 10, |frame| {
+            draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &HashMap::new());
+        });
+        assert!(text.contains("uid 1000"), "{text}");
         assert!(text.contains("8.8.8.8:443"), "{text}");
     }
 
     #[test]
     fn connections_panel_marks_checked_rows() {
         let mut snapshot = Snapshot::now();
-        let conn = fake_connection(443);
-        let key = ConnKey::of(&conn);
-        snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![conn] });
-
-        let mut checked = HashSet::new();
-        checked.insert(key);
+        snapshot.connections =
+            Some(crate::sample::ConnectionSample { connections: vec![fake_unattributed_connection(443)] });
+        let rows = [ConnRow::Connection { index: 0, depth: 0, checked: true }];
         let text = render_to_text(80, 10, |frame| {
-            draw_connections(frame, full_area(80, 10), &snapshot, 0, &checked, &HashMap::new());
+            draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &HashMap::new());
         });
         assert!(text.contains("[x]"), "{text}");
         assert!(!text.contains("[ ]"), "unchecked marker should not appear: {text}");
     }
 
     #[test]
+    fn connections_panel_process_header_shows_collapse_marker_and_counts() {
+        let mut snapshot = Snapshot::now();
+        // Non-empty so `draw_connections` doesn't take its early
+        // no-connections-at-all return — the header's counts below are
+        // synthetic display values, not tied to this fixture's indices.
+        snapshot.connections = Some(crate::sample::ConnectionSample { connections: vec![fake_connection(443)] });
+
+        for (collapsed, marker) in [(true, "▸"), (false, "▾")] {
+            let rows = [ConnRow::Process {
+                pid: 6939,
+                program: Some("claude-desktop".to_string()),
+                depth: 0,
+                collapsed,
+                checked: false,
+                own_connections: 3,
+                subprocesses: 2,
+            }];
+            let text = render_to_text(80, 10, |frame| {
+                draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &HashMap::new());
+            });
+            assert!(text.contains(marker), "expected {marker:?} in {text}");
+            assert!(text.contains("claude-desktop[6939]"), "{text}");
+            assert!(text.contains("(3 connections, 2 subprocesses)"), "{text}");
+        }
+    }
+
+    #[test]
     fn connections_panel_shows_domain_resolution_states() {
         let mut snapshot = Snapshot::now();
-        snapshot.connections = Some(crate::sample::ConnectionSample {
-            connections: vec![fake_connection(443)],
-        });
+        snapshot.connections =
+            Some(crate::sample::ConnectionSample { connections: vec![fake_unattributed_connection(443)] });
+        let rows = [ConnRow::Connection { index: 0, depth: 0, checked: false }];
         let addr: IpAddr = "8.8.8.8".parse().unwrap();
 
         for (state, expected) in [
@@ -930,7 +1034,7 @@ mod tests {
             let enrichment_entry = Enrichment { domains: state, ..Default::default() };
             enrichment.insert(addr, enrichment_entry);
             let text = render_to_text(80, 10, |frame| {
-                draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &enrichment);
+                draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &enrichment);
             });
             assert!(text.contains(expected), "expected {expected:?} in {text}");
         }
@@ -939,11 +1043,11 @@ mod tests {
     #[test]
     fn a_not_yet_requested_connection_shows_an_em_dash_not_a_blank() {
         let mut snapshot = Snapshot::now();
-        snapshot.connections = Some(crate::sample::ConnectionSample {
-            connections: vec![fake_connection(443)],
-        });
+        snapshot.connections =
+            Some(crate::sample::ConnectionSample { connections: vec![fake_unattributed_connection(443)] });
+        let rows = [ConnRow::Connection { index: 0, depth: 0, checked: false }];
         let text = render_to_text(80, 10, |frame| {
-            draw_connections(frame, full_area(80, 10), &snapshot, 0, &HashSet::new(), &HashMap::new());
+            draw_connections(frame, full_area(80, 10), &snapshot, &rows, 0, &HashMap::new());
         });
         assert!(text.contains('—'), "expected an em-dash for unresolved domain: {text}");
     }
@@ -952,9 +1056,9 @@ mod tests {
     #[test]
     fn connections_panel_shows_route_resolution_states() {
         let mut snapshot = Snapshot::now();
-        snapshot.connections = Some(crate::sample::ConnectionSample {
-            connections: vec![fake_connection(443)],
-        });
+        snapshot.connections =
+            Some(crate::sample::ConnectionSample { connections: vec![fake_unattributed_connection(443)] });
+        let rows = [ConnRow::Connection { index: 0, depth: 0, checked: false }];
         let addr: IpAddr = "8.8.8.8".parse().unwrap();
 
         for (state, expected) in [
@@ -972,7 +1076,7 @@ mod tests {
             let mut enrichment = HashMap::new();
             enrichment.insert(addr, Enrichment { route: state, ..Default::default() });
             let text = render_to_text(100, 10, |frame| {
-                draw_connections(frame, full_area(100, 10), &snapshot, 0, &HashSet::new(), &enrichment);
+                draw_connections(frame, full_area(100, 10), &snapshot, &rows, 0, &enrichment);
             });
             assert!(text.contains(expected), "expected {expected:?} in {text}");
         }
@@ -1026,7 +1130,7 @@ mod tests {
         });
         for key in [
             "quit", "cycle panels", "pause", "reset", "help", "interval",
-            "row cursor", "checkbox", "resolve",
+            "row cursor", "checkbox", "resolve", "collapse",
         ] {
             assert!(text.contains(key), "missing {key:?} in help text: {text}");
         }
