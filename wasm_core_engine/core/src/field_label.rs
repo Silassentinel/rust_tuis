@@ -15,6 +15,20 @@ pub enum FieldKind {
     YesNo,
     Select,
     Mix,
+    /// `(tracker-ref)` — this field's value is one or more references to
+    /// other trackers (each paired with how much of it was used), not
+    /// free text. No domain-specific parsing lives here: `core` stays
+    /// domain-agnostic (see this module's own doc comment on where the
+    /// parenthetical-syntax convention lives), so this variant only marks
+    /// *that* a field is a reference — the referenced-tracker/amount-used
+    /// value shape and its own string encoding live in the ferment domain
+    /// layer's `tracker_ref` module, alongside `mix.rs`'s analogous
+    /// split (`FieldKind::Mix` here, `mix.rs`'s `MixPart`/`parse_mix`
+    /// elsewhere). No static `options` list either (unlike `Select`/
+    /// `Mix`, which declare their choices in the template) — the actual
+    /// choices are which trackers exist right now, which only the app
+    /// layer (with a live `Store`) can answer.
+    TrackerRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +108,21 @@ pub fn parse_field_label(raw: &str) -> ParsedField {
             return ParsedField {
                 label: raw.to_string(),
                 kind: FieldKind::TextWide,
+                options: None,
+            };
+        }
+
+        // "(tracker-ref)" — checked before "mix:"/select/number below,
+        // same reasoning as those: a marker keyword takes priority over
+        // the more general rules it would otherwise also match (though in
+        // practice "tracker-ref" contains no "/", no lone "g", and no unit
+        // substring, so it wouldn't accidentally hit any of them anyway —
+        // checked first purely for the same "special markers first"
+        // reading order the rest of this function already follows).
+        if inner_lower == "tracker-ref" {
+            return ParsedField {
+                label: raw.to_string(),
+                kind: FieldKind::TrackerRef,
                 options: None,
             };
         }
@@ -199,6 +228,18 @@ mod tests {
             field.options,
             Some(vec!["surface only".to_string(), "throughout".to_string()])
         );
+    }
+
+    #[test]
+    fn recognizes_a_tracker_ref_marker() {
+        let field = parse_field_label("Source F1 batch (tracker-ref)");
+        assert_eq!(field.kind, FieldKind::TrackerRef);
+        assert_eq!(field.options, None);
+    }
+
+    #[test]
+    fn tracker_ref_marker_is_case_insensitive() {
+        assert_eq!(parse_field_label("Source (TRACKER-REF)").kind, FieldKind::TrackerRef);
     }
 
     #[test]

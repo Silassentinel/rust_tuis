@@ -9,6 +9,7 @@ pub mod mix;
 pub mod schedule;
 pub mod storage;
 pub mod text;
+pub mod tracker_ref;
 
 pub use datetime::DateTime;
 pub use field_label::{parse_field_label, FieldKind, ParsedField};
@@ -19,4 +20,5 @@ pub use schedule::{compute_next_due, format_cadence, format_due, Cadence, DueInf
 #[cfg(not(target_arch = "wasm32"))]
 pub use storage::FsStore;
 pub use storage::{Store, StoreError};
-pub use text::title_case;
+pub use text::{slugify, title_case};
+pub use tracker_ref::{format_tracker_refs, parse_tracker_refs, TrackerRefPart};

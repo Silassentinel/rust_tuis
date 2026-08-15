@@ -31,8 +31,10 @@ fn is_ascii_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-// \d+(?:[.,]\d+)? — matches only, not partial.
-fn parse_number_token(s: &str) -> Option<f64> {
+// \d+(?:[.,]\d+)? — matches only, not partial. `pub(crate)` (not private)
+// so `tracker_ref.rs`'s own part-amount parser can reuse the exact same
+// grammar instead of a second, possibly-drifting copy of it.
+pub(crate) fn parse_number_token(s: &str) -> Option<f64> {
     let (int_part, frac_part) = match s.find(['.', ',']) {
         Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
         None => (s, None),
