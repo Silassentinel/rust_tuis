@@ -1113,6 +1113,119 @@ sign-off; the other five are not.
 
 ---
 
+## Second phase, continued: generalized panel scrolling
+
+- [x] **Chunk 19: generalize scrolling to every list/table panel.** Real
+      usage against the built binary (post-chunk-18) surfaced the exact
+      same missing-`ListState` bug in two more panels: CPU (a 24-thread
+      machine, only 8 `core*` rows ever visible) and Thermal (a 7-chip
+      machine, the last chip's sensors cut off entirely). Asked whether to
+      patch just those two, the answer was "isn't there an abstraction to
+      be made... do it once, fix everywhere" — so this chunk generalizes
+      chunk 18's Connections-only cursor mechanism into one piece of
+      `App` state and one pair of render helpers, applied to every panel
+      whose content can in principle overflow its height: CPU, Thermal,
+      GPU (`List`-based) and Disk's device table / Net's interface table
+      (`Table`-based, confirmed `TableState` has the identical
+      `select`-drives-auto-scroll shape as `ListState` by reading
+      `ratatui-widgets-0.3.2`'s source directly).
+
+      Implementation: `App.connections_cursor: usize` became
+      `App.panel_cursor: HashMap<Panel, usize>` (`Panel` gained `Hash`),
+      with `cursor(panel)`/`scrollable_len(panel)`/`move_cursor()`/
+      `clamp_cursor(panel)` replacing the Connections-only versions.
+      `on_key`'s `Up`/`Down` became unconditional (previously gated to
+      `Panel::Connections`) — naturally inert on `Overview`/`Memory` since
+      `scrollable_len` returns `0` there, no special-casing needed.
+      `refresh()` now clamps every panel's cursor, not just the focused
+      one, so a panel whose data shrank in the background never shows a
+      stale out-of-range cursor once it's tabbed to. Thermal and GPU
+      needed more than a `.len()` on their snapshot data — a chip expands
+      into a header line plus one line per temp/fan, a GPU into a header
+      plus conditional vram/temp/freq lines — so rather than duplicate
+      that expansion logic between `App` (for the count) and `widgets.rs`
+      (for the content), it was extracted into `ThermalRow`/`thermal_rows`
+      and `GpuRow`/`gpu_rows` in `ui/app.rs`, the exact pattern chunk 18
+      already established for `ConnRow`/`connections_rows` — both the
+      length check and the renderer now call the same function, so they
+      can't drift apart. CPU/Disk/Net stayed simple `.len()` checks (their
+      data is already flat, one record per row). Two shared render
+      helpers, `render_stateful_list`/`render_stateful_table` in
+      `ui/widgets.rs`, replaced five separate inline `List`/`Table`
+      constructions (including refactoring `draw_connections` to use the
+      shared helper too, removing chunk 18's own duplicate `ListState`
+      code). Every scrollable row now gets the same `REVERSED` cursor
+      highlight Connections already used — a scroll with no visible
+      indicator of position would be confusing.
+
+      **Explicitly out of scope**: Disk's second sub-section (the
+      mount-point list) renders through a `Paragraph`, which has no
+      selection-based auto-scroll primitive — only a manual `.scroll`
+      offset with no built-in clamping. Folding that in would need a
+      genuinely different, hand-rolled mechanism, not a reuse of what this
+      chunk built; mount counts are typically small enough that this
+      hasn't been a real problem in practice. Flagged in the man page,
+      README, and here, rather than silently building a third bespoke
+      scrolling mechanism to close a gap nobody had hit.
+
+      Tests: `every_scrollable_panel_wraps_against_its_own_real_row_count`
+      (CPU/Thermal/Disk/Net/GPU each wrap correctly against their *real*
+      row count — Thermal/GPU specifically prove `scrollable_len` is
+      wired to `thermal_rows`/`gpu_rows`, not a naive chip/GPU count),
+      `overview_and_memory_have_nothing_to_scroll`,
+      `cursor_movement_only_affects_the_focused_panels_own_cursor`,
+      `clamp_cursor_generalizes_to_every_panel_not_just_connections`,
+      `refresh_clamps_every_panels_cursor_not_just_the_focused_one`, plus
+      two `ui::widgets` tests that prove the actual bug is fixed rather
+      than just that the code compiles: a CPU snapshot with 20 cores and a
+      Thermal snapshot with 10 chips, each rendered into a small area
+      first with the cursor at `0` (asserting the last core/chip is
+      genuinely absent from the rendered text) and then with the cursor at
+      the last row (asserting it's now present). 396 unit tests + 8
+      integration tests in the default build (up from 390 + 8 after chunk
+      18), 385 unit tests with `tui` and no `traceroute`, 282 unit tests
+      with `--no-default-features` — all three clean under
+      `cargo clippy --all-targets` too.
+
+      Real-hardware verification: a real pty session (the `pyte`-based
+      technique from chunk 18) against the actual built binary confirmed
+      the exact reported bug is fixed live, not just in unit tests — 30
+      `Down` presses on the CPU panel wrapped the cursor to `core6`
+      (`30 mod 24`) with the visible window scrolled to keep it in frame,
+      and scrolling the Thermal panel past the first six chips revealed
+      the seventh (`amdgpu`)'s sensors (`junction`/`mem`/`fan1`) that were
+      completely invisible before this chunk. The same session confirmed
+      chunk 18's Connections tree/checkbox/collapse behavior is completely
+      unaffected by this refactor (grouping, bulk-check, collapse/expand
+      all still worked identically).
+
+      Decisions worth knowing about:
+
+      1. **Thermal/GPU row-building moved into `ui/app.rs`, not
+         `ui/widgets.rs`.** The row *count* (needed by `App` for cursor
+         bounds) and the row *content* (needed by `widgets.rs` for
+         rendering) have to agree exactly, or the cursor could point at a
+         row that isn't actually where the highlight lands. Rather than
+         have `App` duplicate `widgets.rs`'s line-building logic (a real
+         drift risk — a future change to how a chip renders would have to
+         remember to update two places identically), both now call the
+         same `thermal_rows`/`gpu_rows` functions, living next to `ConnRow`
+         in `app.rs` per this crate's established "collectors/app resolve
+         structure, widgets only render" split.
+      2. **`panel_cursor` is a single `HashMap<Panel, usize>` covering all
+         eight panels, not per-panel fields.** `Connections`'s entry in
+         that map does everything `connections_cursor` used to; the tree/
+         checkbox/collapse logic built on top of it in chunk 18 needed no
+         redesign at all, only a search-and-replace from
+         `self.connections_cursor` to `self.cursor(Panel::Connections)`.
+      3. **The mount-list `Paragraph` gap is a known, permanent-for-now
+         limitation, not an oversight** — see "Explicitly out of scope"
+         above. Worth revisiting only if someone actually hits a machine
+         with enough mounts to overflow the panel, which hasn't happened
+         yet on any machine this crate has been run against.
+
+---
+
 ## Cross-cutting rules for every chunk
 
 - No `unwrap`/`expect`/panic in library code — the security model depends on it.

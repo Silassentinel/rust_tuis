@@ -96,6 +96,16 @@ Cycle panel focus.
 Jump directly to a panel (CPU, memory, thermal, disk, net, GPU,
 connections).
 .TP
+.B Up, Down
+Scroll whichever panel currently has focus \(em every panel whose content
+can exceed its rendered height (CPU's per\-core list, Thermal's per\-sensor
+list, Disk's device table, Net's interface table, GPU, and Connections)
+keeps the cursor row visible, scrolling as needed. No effect on
+.B Overview
+or
+.BR Memory ,
+which have nothing to scroll.
+.TP
 .B space
 Pause/resume the refresh loop.
 .TP
@@ -115,9 +125,6 @@ process's
 .I PPid
 from
 .IR /proc/<pid>/status ):
-.TP
-.B Up, Down
-Move the row cursor.
 .TP
 .B x
 Toggle the cursor row's checkbox. On a process\-header row this checks or
@@ -307,6 +314,10 @@ route (its checkbox still resolves a domain name normally). Needs
 and only exists in builds with the
 .B traceroute
 Cargo feature (on by default).
+.IP \(bu 2
+Disk's mount\-point list (the lines below its device table) does not
+scroll \(em only the device table above it does. Mount counts are
+typically small enough that this hasn't been a real problem in practice.
 .SH SEE ALSO
 .BR top (1),
 .BR free (1),

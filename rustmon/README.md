@@ -4,11 +4,18 @@ A read-only hardware monitor for Linux. Part of the [`rust_tuis`](../README.md)
 collection.
 
 > **Status: the live TUI, `--once`, and `--summary` all work and are fully
-> tested — including per-connection DNS resolution, route tracing, and a
-> process-tree connections panel.** 390 unit tests + 8 end-to-end tests
-> against the compiled binary in the default build, all green (also
-> verified at 379 unit tests with `tui` and no `traceroute` feature, and
-> 282 unit tests with `--no-default-features`).
+> tested — including per-connection DNS resolution, route tracing, a
+> process-tree connections panel, and cursor-based scrolling on every
+> panel whose content can overflow its height.** 396 unit tests + 8
+> end-to-end tests against the compiled binary in the default build, all
+> green (also verified at 385 unit tests with `tui` and no `traceroute`
+> feature, and 282 unit tests with `--no-default-features`). Scrolling was
+> added after real usage showed CPU (24 threads, only 8 visible) and
+> Thermal (a 7-chip machine, the last chip's sensors cut off) silently
+> clipping instead of scrolling — the same missing-`ListState` bug the
+> Connections panel had, generalized into one mechanism and applied to
+> every list/table panel (CPU, Thermal, GPU, Disk, Net) rather than
+> patched one panel at a time.
 > `rustmon`, `rustmon --once`, `rustmon --once --format json`, and
 > `rustmon --summary` are all real, working commands — run for real against
 > this machine and verified, not just unit-tested: the JSON was piped
@@ -38,7 +45,12 @@ collection.
 > `unavailable` state transition; a real privileged trace against live
 > network hops was attempted but blocked in this sandbox by `sudo`
 > requiring an interactive password — a known verification gap, noted
-> here rather than glossed over. NVIDIA GPU support was declined
+> here rather than glossed over. The scrolling fix was confirmed live too:
+> a real pty session with 30 `Down` presses on the CPU panel landed the
+> cursor at `core6` (`30 mod 24`) with the view scrolled to keep it
+> visible, and the same technique on the Thermal panel scrolled past the
+> first six chips to reveal the seventh (`amdgpu`)'s previously-invisible
+> sensors — the exact bug reported. NVIDIA GPU support was declined
 > (chunk 10's remainder, `nvml-wrapper`) — no NVIDIA hardware on the target
 > machine; AMD/Intel GPU support is unaffected. The original 11-chunk build
 > plan is complete; a second phase (man page, `--summary`, connection
@@ -70,20 +82,24 @@ no internet-facing connections) are omitted entirely, not shown empty.
 | `q`, `Esc`, `Ctrl-C` | Quit |
 | `Tab` / `Shift-Tab` | Cycle panel focus |
 | `1`–`7` | Jump to a panel |
+| `Up` / `Down` | Scroll whichever panel has focus — every panel whose content can exceed its height (CPU, Thermal, Disk, Net, GPU, Connections) keeps the cursor row in view; no effect on Overview/Memory |
 | `space` | Pause/resume |
 | `r` | Reset the rate tracker (drops the next interval rather than averaging across the gap) |
 | `?` | Toggle the help overlay |
 | `+` / `-` | Adjust the refresh interval (floor: 100 ms) |
 
+(Disk's mount-point list, below its device table, is the one exception —
+a `Paragraph`, not a `List`/`Table`, so it doesn't scroll. Mount counts are
+typically small enough that this hasn't been a real problem.)
+
 Connections are grouped into a collapsible tree by real OS parent/child
 process relationship (each process's `PPid` from `/proc/<pid>/status`), so
 a process pool of a dozen connections collapses to one line.
 
-With the connections panel focused:
+With the connections panel focused specifically:
 
 | Key | Does |
 |---|---|
-| `Up` / `Down` | Move the row cursor |
 | `x` | Toggle the cursor row's checkbox — on a process-header row, checks/unchecks its *entire* subtree at once |
 | `Left` / `Right` | Collapse / expand the cursor row's process group (visual only — a bulk checkbox toggle still reaches every connection underneath) |
 | `Enter` | Resolve every checked row's remote IP to a domain name, and (on builds with the `traceroute` feature) a route |

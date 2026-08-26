@@ -21,17 +21,51 @@ use std::time::Duration;
 use ratatui::layout::{Constraint, Layout as RLayout, Rect as RRect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::Frame;
 
 use crate::delta::Rates;
 use crate::sample::{ConnProtocol, Snapshot, TempSeverity};
-use crate::ui::app::{ConnRow, EnrichState, Enrichment};
+use crate::ui::app::{gpu_rows, thermal_rows, ConnRow, EnrichState, Enrichment, GpuRow, ThermalRow};
 use crate::ui::layout::Rect;
 use crate::units::Percent;
 
 fn to_ratatui(area: Rect) -> RRect {
     RRect::new(area.x, area.y, area.width, area.height)
+}
+
+/// Render `items` as a scrollable list, keeping row `cursor` within the
+/// visible viewport — ratatui computes the offset needed to keep the
+/// selected index in view once it's set via `ListState::select`. The one
+/// shared mechanism behind every scrollable list-based panel in this
+/// crate, so a panel whose content overflows its height scrolls instead of
+/// silently clipping.
+fn render_stateful_list(frame: &mut Frame, area: RRect, items: Vec<ListItem>, cursor: usize) {
+    let mut state = ListState::default();
+    state.select(Some(cursor));
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+}
+
+/// Same idea as [`render_stateful_list`], for table-based panels —
+/// `TableState` has the identical `select`-drives-auto-scroll shape as
+/// `ListState`.
+fn render_stateful_table(frame: &mut Frame, area: RRect, rows: Vec<Row>, widths: &[Constraint], header: Row, cursor: usize) {
+    let mut state = TableState::default();
+    state.select(Some(cursor));
+    let table = Table::new(rows, widths).header(header);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Adds the cursor row's highlight (the same visible indicator every
+/// scrollable panel in this crate uses, so scrolling never moves an
+/// invisible cursor) on top of whatever `style` a row already has — e.g. a
+/// thermal sensor's severity colour, or a chip/GPU header's bold.
+fn cursor_style(style: Style, idx: usize, cursor: usize) -> Style {
+    if idx == cursor {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
 }
 
 /// Title bar: hostname, kernel, uptime, CPU model, refresh interval, paused
@@ -104,7 +138,14 @@ fn human_duration(total_secs: u64) -> String {
 /// trail is [`crate::delta::cpu_busy_percent`], a pure computation with no
 /// I/O, so doing it here doesn't violate this module's "no filesystem access"
 /// rule any more than reading `rates.cpu_total` does.
-pub fn draw_cpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Option<&Rates>, history: &[Snapshot]) {
+pub fn draw_cpu(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &Snapshot,
+    rates: Option<&Rates>,
+    history: &[Snapshot],
+    cursor: usize,
+) {
     let outer = to_ratatui(area);
     let block = Block::bordered().title("CPU");
     let inner = block.inner(outer);
@@ -154,10 +195,11 @@ pub fn draw_cpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Optio
             let freq_str = freq
                 .map(|f| format!("{:.2} GHz", f.as_ghz()))
                 .unwrap_or_else(|| "—".to_string());
-            ListItem::new(format!("core{idx:<3} {bar} {busy_str} {freq_str}"))
+            let line = format!("core{idx:<3} {bar} {busy_str} {freq_str}");
+            ListItem::new(Line::from(Span::styled(line, cursor_style(Style::default(), idx, cursor))))
         })
         .collect();
-    frame.render_widget(List::new(items), chunks[2]);
+    render_stateful_list(frame, chunks[2], items, cursor);
 
     if has_history {
         let data: Vec<u64> = history
@@ -235,42 +277,48 @@ pub fn draw_memory(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
 }
 
 /// Sensors grouped by chip, coloured by [`TempSeverity`], with fan RPMs.
-pub fn draw_thermal(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
+///
+/// Renders [`thermal_rows`] rather than iterating `snapshot.thermal`
+/// itself — that same row list is what [`crate::ui::app::App::cursor`]'s
+/// bounds are computed against, so the two can never disagree about how
+/// many rows there are.
+pub fn draw_thermal(frame: &mut Frame, area: Rect, snapshot: &Snapshot, cursor: usize) {
     let outer = to_ratatui(area);
     let block = Block::bordered().title("Thermal");
     let inner = block.inner(outer);
     frame.render_widget(block, outer);
 
-    let Some(thermal) = &snapshot.thermal else {
+    if snapshot.thermal.is_none() {
         frame.render_widget(Paragraph::new("no thermal data"), inner);
         return;
-    };
-
-    let mut items: Vec<ListItem> = Vec::new();
-    for chip in &thermal.chips {
-        items.push(ListItem::new(Line::from(Span::styled(
-            chip.name.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))));
-        for t in &chip.temps {
-            let colour = ratatui_colour(severity_colour(t.severity()));
-            let line = format!("  {:<24} {:>6.1} C", t.label, t.value.as_celsius());
-            items.push(ListItem::new(Line::from(Span::styled(line, Style::default().fg(colour)))));
-        }
-        for f in &chip.fans {
-            items.push(ListItem::new(format!("  {:<24} {} rpm", f.label, f.rpm.as_u64())));
-        }
     }
 
-    if items.is_empty() {
+    let rows = thermal_rows(snapshot.thermal.as_ref());
+    if rows.is_empty() {
         frame.render_widget(Paragraph::new("no sensors"), inner);
-    } else {
-        frame.render_widget(List::new(items), inner);
+        return;
     }
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let (line, base_style) = match row {
+                ThermalRow::ChipHeader { name } => (name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                ThermalRow::Temp { label, celsius, severity } => {
+                    let colour = ratatui_colour(severity_colour(*severity));
+                    (format!("  {label:<24} {celsius:>6.1} C"), Style::default().fg(colour))
+                }
+                ThermalRow::Fan { label, rpm } => (format!("  {label:<24} {rpm} rpm"), Style::default()),
+            };
+            ListItem::new(Line::from(Span::styled(line, cursor_style(base_style, idx, cursor))))
+        })
+        .collect();
+    render_stateful_list(frame, inner, items, cursor);
 }
 
 /// Per-device read/write throughput and utilisation.
-pub fn draw_disk(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Option<&Rates>) {
+pub fn draw_disk(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Option<&Rates>, cursor: usize) {
     let outer = to_ratatui(area);
     let block = Block::bordered().title("Disk");
     let inner = block.inner(outer);
@@ -284,16 +332,20 @@ pub fn draw_disk(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Opti
     let rows: Vec<Row> = disk
         .devices
         .iter()
-        .map(|d| match rates.and_then(|r| r.disk.get(&d.name)) {
-            Some(r) => Row::new(vec![
-                d.name.clone(),
-                r.read.human(),
-                r.write.human(),
-                r.utilisation
-                    .map(|p| format!("{:.0}%", p.as_f64()))
-                    .unwrap_or_else(|| "—".to_string()),
-            ]),
-            None => Row::new(vec![d.name.clone(), "—".to_string(), "—".to_string(), "—".to_string()]),
+        .enumerate()
+        .map(|(idx, d)| {
+            let row = match rates.and_then(|r| r.disk.get(&d.name)) {
+                Some(r) => Row::new(vec![
+                    d.name.clone(),
+                    r.read.human(),
+                    r.write.human(),
+                    r.utilisation
+                        .map(|p| format!("{:.0}%", p.as_f64()))
+                        .unwrap_or_else(|| "—".to_string()),
+                ]),
+                None => Row::new(vec![d.name.clone(), "—".to_string(), "—".to_string(), "—".to_string()]),
+            };
+            row.style(cursor_style(Style::default(), idx, cursor))
         })
         .collect();
 
@@ -303,19 +355,24 @@ pub fn draw_disk(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Opti
         Constraint::Length(12),
         Constraint::Length(6),
     ];
-    let table = Table::new(rows, widths).header(
-        Row::new(vec!["device", "read", "write", "util"]).style(Style::default().add_modifier(Modifier::BOLD)),
-    );
+    let header =
+        Row::new(vec!["device", "read", "write", "util"]).style(Style::default().add_modifier(Modifier::BOLD));
 
     if disk.mounts.is_empty() {
-        frame.render_widget(table, inner);
+        render_stateful_table(frame, inner, rows, &widths, header, cursor);
         return;
     }
 
     let device_rows = (disk.devices.len() as u16 + 1).max(2);
     let chunks = RLayout::vertical([Constraint::Length(device_rows), Constraint::Min(0)]).split(inner);
-    frame.render_widget(table, chunks[0]);
+    render_stateful_table(frame, chunks[0], rows, &widths, header, cursor);
 
+    // The mount-point list below is a `Paragraph`, not a `List`/`Table` —
+    // it doesn't get cursor-based scrolling in this chunk. `Paragraph` has
+    // no selection-based auto-scroll primitive (only a manual `.scroll`
+    // offset with no built-in clamping), a genuinely different mechanism
+    // from the one this chunk generalizes; mount counts are typically
+    // small enough that this hasn't been a real problem in practice.
     let mount_lines: Vec<Line> = disk
         .mounts
         .iter()
@@ -331,7 +388,7 @@ pub fn draw_disk(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Opti
 }
 
 /// Per-interface RX/TX throughput and link state.
-pub fn draw_net(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Option<&Rates>) {
+pub fn draw_net(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Option<&Rates>, cursor: usize) {
     let outer = to_ratatui(area);
     let block = Block::bordered().title("Net");
     let inner = block.inner(outer);
@@ -345,12 +402,14 @@ pub fn draw_net(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Optio
     let rows: Vec<Row> = net
         .interfaces
         .iter()
-        .map(|i| {
+        .enumerate()
+        .map(|(idx, i)| {
             let state = i.operstate.as_deref().unwrap_or("—");
-            match rates.and_then(|r| r.net.get(&i.name)) {
+            let row = match rates.and_then(|r| r.net.get(&i.name)) {
                 Some(r) => Row::new(vec![i.name.clone(), state.to_string(), r.rx.human(), r.tx.human()]),
                 None => Row::new(vec![i.name.clone(), state.to_string(), "—".to_string(), "—".to_string()]),
-            }
+            };
+            row.style(cursor_style(Style::default(), idx, cursor))
         })
         .collect();
 
@@ -360,48 +419,51 @@ pub fn draw_net(frame: &mut Frame, area: Rect, snapshot: &Snapshot, rates: Optio
         Constraint::Length(12),
         Constraint::Length(12),
     ];
-    let table = Table::new(rows, widths).header(
-        Row::new(vec!["interface", "state", "rx", "tx"]).style(Style::default().add_modifier(Modifier::BOLD)),
-    );
-    frame.render_widget(table, inner);
+    let header =
+        Row::new(vec!["interface", "state", "rx", "tx"]).style(Style::default().add_modifier(Modifier::BOLD));
+    render_stateful_table(frame, inner, rows, &widths, header, cursor);
 }
 
 /// Per-GPU utilisation, VRAM, temperature, power.
-pub fn draw_gpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot) {
+///
+/// Renders [`gpu_rows`] rather than iterating `snapshot.gpus` itself — see
+/// [`draw_thermal`]'s doc for why (the same reasoning applies here: a GPU
+/// expands into a variable number of lines, so the row count must come
+/// from the same place the row content does).
+pub fn draw_gpu(frame: &mut Frame, area: Rect, snapshot: &Snapshot, cursor: usize) {
     let outer = to_ratatui(area);
     let block = Block::bordered().title("GPU");
     let inner = block.inner(outer);
     frame.render_widget(block, outer);
 
-    let Some(gpu) = &snapshot.gpus else {
+    if snapshot.gpus.is_none() {
         frame.render_widget(Paragraph::new("no GPU data"), inner);
         return;
-    };
-
-    let mut items: Vec<ListItem> = Vec::new();
-    for g in &gpu.gpus {
-        let busy = g.busy.map(|p| format!("{:.0}%", p.as_f64())).unwrap_or_else(|| "—".to_string());
-        items.push(ListItem::new(Line::from(Span::styled(
-            format!("{} ({:?}) {busy}", g.name, g.vendor),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))));
-
-        if let (Some(used), Some(total)) = (g.vram_used, g.vram_total) {
-            items.push(ListItem::new(format!("  vram {used} / {total}")));
-        }
-        if let Some(t) = g.temp {
-            items.push(ListItem::new(format!("  temp {:.1} C", t.as_celsius())));
-        }
-        if let Some(f) = g.freq_khz {
-            items.push(ListItem::new(format!("  freq {:.2} GHz", f.as_ghz())));
-        }
     }
 
-    if items.is_empty() {
+    let rows = gpu_rows(snapshot.gpus.as_ref());
+    if rows.is_empty() {
         frame.render_widget(Paragraph::new("no GPUs found"), inner);
-    } else {
-        frame.render_widget(List::new(items), inner);
+        return;
     }
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let (line, base_style) = match row {
+                GpuRow::Header { name, vendor, busy } => {
+                    let busy = busy.map(|p| format!("{:.0}%", p.as_f64())).unwrap_or_else(|| "—".to_string());
+                    (format!("{name} ({vendor:?}) {busy}"), Style::default().add_modifier(Modifier::BOLD))
+                }
+                GpuRow::Vram { used, total } => (format!("  vram {used} / {total}"), Style::default()),
+                GpuRow::Temp { celsius } => (format!("  temp {celsius:.1} C"), Style::default()),
+                GpuRow::Freq { ghz } => (format!("  freq {ghz:.2} GHz"), Style::default()),
+            };
+            ListItem::new(Line::from(Span::styled(line, cursor_style(base_style, idx, cursor))))
+        })
+        .collect();
+    render_stateful_list(frame, inner, items, cursor);
 }
 
 /// Per-process internet-facing connections, as a collapsible process tree:
@@ -496,24 +558,11 @@ pub fn draw_connections(
                 }
             };
 
-            let style = if idx == cursor {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(Span::styled(line, style)))
+            ListItem::new(Line::from(Span::styled(line, cursor_style(Style::default(), idx, cursor))))
         })
         .collect();
 
-    // A plain `render_widget(List::new(items), ...)` always draws from the
-    // top of the list and clips anything past the panel's height — moving
-    // `cursor` past the visible rows would highlight a row you can't see.
-    // Routing through `ListState` (even a fresh one every frame; `select`
-    // is all ratatui needs to compute a scroll offset that keeps the
-    // selected row in view) makes the cursor actually scroll the viewport.
-    let mut state = ListState::default();
-    state.select(Some(cursor));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    render_stateful_list(frame, inner, items, cursor);
 }
 
 /// Render one connection's route state — `—` (never requested), `tracing…`
@@ -710,18 +759,48 @@ mod tests {
     fn cpu_panel_renders_model_and_per_core_rows_without_panic() {
         let snapshot = snapshot_with_cpu();
         let text = render_to_text(80, 20, |frame| {
-            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[]);
+            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[], 0);
         });
         assert!(text.contains("CPU"), "{text}");
         assert!(text.contains("core0"), "{text}");
         assert!(text.contains("core1"), "{text}");
     }
 
+    /// Proves the actual bug this chunk fixes, not just that the code
+    /// compiles: a plain `render_widget(List::new(items), ...)` always
+    /// draws from the top and clips anything past the panel's height,
+    /// which is exactly what happened before `render_stateful_list`
+    /// existed (a 24-thread CPU only ever showed its first 8 cores, no
+    /// matter where the cursor was).
+    #[test]
+    fn cpu_panel_cursor_scrolls_to_reveal_a_clipped_core() {
+        let mut s = Snapshot::now();
+        s.cpu = Some(CpuSample {
+            total: CpuTimes::default(),
+            per_core: vec![CpuTimes::default(); 20],
+            freq_khz: vec![None; 20],
+            load_avg: None,
+            model: None,
+            ctxt: None,
+            btime: None,
+        });
+
+        let at_top = render_to_text(40, 10, |frame| {
+            draw_cpu(frame, full_area(40, 10), &s, None, &[], 0);
+        });
+        assert!(!at_top.contains("core19"), "core19 should still be clipped with the cursor at the top: {at_top}");
+
+        let scrolled = render_to_text(40, 10, |frame| {
+            draw_cpu(frame, full_area(40, 10), &s, None, &[], 19);
+        });
+        assert!(scrolled.contains("core19"), "moving the cursor to the last core must scroll it into view: {scrolled}");
+    }
+
     #[test]
     fn cpu_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(80, 20, |frame| {
-            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[]);
+            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[], 0);
         });
         assert!(text.contains("no CPU data"), "{text}");
     }
@@ -736,7 +815,7 @@ mod tests {
         let history = [a, b];
         // Must not panic building the sparkline data from raw counters.
         let _text = render_to_text(80, 20, |frame| {
-            draw_cpu(frame, full_area(80, 20), &history[1], None, &history);
+            draw_cpu(frame, full_area(80, 20), &history[1], None, &history, 0);
         });
     }
 
@@ -744,7 +823,7 @@ mod tests {
     fn absent_per_core_frequency_and_rate_render_as_an_em_dash_not_zero() {
         let snapshot = snapshot_with_cpu(); // core1's freq is None
         let text = render_to_text(80, 20, |frame| {
-            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[]);
+            draw_cpu(frame, full_area(80, 20), &snapshot, None, &[], 0);
         });
         assert!(text.contains('—'), "expected an em-dash for absent data: {text}");
     }
@@ -810,7 +889,7 @@ mod tests {
             }],
         });
         let text = render_to_text(60, 10, |frame| {
-            draw_thermal(frame, full_area(60, 10), &snapshot);
+            draw_thermal(frame, full_area(60, 10), &snapshot, 0);
         });
         assert!(text.contains("k10temp"), "{text}");
         assert!(text.contains("Tctl"), "{text}");
@@ -819,11 +898,44 @@ mod tests {
         assert!(text.contains("0 rpm"), "{text}");
     }
 
+    /// Same real bug this chunk fixes as CPU's — the reported screenshot
+    /// showed a 7-chip Thermal panel with the last chip's sensors cut off
+    /// entirely, no way to scroll to them.
+    #[test]
+    fn thermal_panel_cursor_scrolls_to_reveal_a_clipped_chip() {
+        let mut s = Snapshot::now();
+        s.thermal = Some(ThermalSample {
+            chips: (0..10)
+                .map(|i| HwmonChip {
+                    name: format!("chip{i}"),
+                    temps: vec![TempSensor {
+                        label: "t".to_string(),
+                        value: MilliCelsius::from_millidegrees(1000),
+                        max: None,
+                        crit: None,
+                    }],
+                    fans: vec![],
+                })
+                .collect(),
+        });
+        // 10 chips * (1 header + 1 temp) = 20 rows, last index 19.
+
+        let at_top = render_to_text(40, 10, |frame| {
+            draw_thermal(frame, full_area(40, 10), &s, 0);
+        });
+        assert!(!at_top.contains("chip9"), "chip9 should still be clipped with the cursor at the top: {at_top}");
+
+        let scrolled = render_to_text(40, 10, |frame| {
+            draw_thermal(frame, full_area(40, 10), &s, 19);
+        });
+        assert!(scrolled.contains("chip9"), "scrolling to the last row must reveal chip9: {scrolled}");
+    }
+
     #[test]
     fn thermal_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(60, 10, |frame| {
-            draw_thermal(frame, full_area(60, 10), &snapshot);
+            draw_thermal(frame, full_area(60, 10), &snapshot, 0);
         });
         assert!(text.contains("no thermal data"), "{text}");
     }
@@ -834,7 +946,7 @@ mod tests {
     fn disk_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(60, 10, |frame| {
-            draw_disk(frame, full_area(60, 10), &snapshot, None);
+            draw_disk(frame, full_area(60, 10), &snapshot, None, 0);
         });
         assert!(text.contains("no disk data"), "{text}");
     }
@@ -843,7 +955,7 @@ mod tests {
     fn net_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(60, 10, |frame| {
-            draw_net(frame, full_area(60, 10), &snapshot, None);
+            draw_net(frame, full_area(60, 10), &snapshot, None, 0);
         });
         assert!(text.contains("no net data"), "{text}");
     }
@@ -852,7 +964,7 @@ mod tests {
     fn gpu_panel_with_no_data_does_not_panic() {
         let snapshot = Snapshot::now();
         let text = render_to_text(60, 10, |frame| {
-            draw_gpu(frame, full_area(60, 10), &snapshot);
+            draw_gpu(frame, full_area(60, 10), &snapshot, 0);
         });
         assert!(text.contains("no GPU data"), "{text}");
     }
@@ -874,7 +986,7 @@ mod tests {
             }],
         });
         let text = render_to_text(60, 10, |frame| {
-            draw_gpu(frame, full_area(60, 10), &snapshot);
+            draw_gpu(frame, full_area(60, 10), &snapshot, 0);
         });
         assert!(text.contains("card1"), "{text}");
     }

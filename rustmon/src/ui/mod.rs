@@ -40,7 +40,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::sample::Snapshot;
 
-use app::{App, KeyPress};
+use app::{App, KeyPress, Panel};
 
 /// Run the TUI until the user quits. Returns the process exit code.
 pub fn run(config: &Config) -> Result<i32> {
@@ -133,22 +133,29 @@ fn draw_frame(frame: &mut Frame, app: &App) {
         widgets::draw_header(frame, rect, snapshot, &app.hostname, &app.kernel, app.config.interval, app.paused);
     }
     if let Some(rect) = computed.cpu {
-        widgets::draw_cpu(frame, rect, snapshot, app.rates.as_ref(), app.history.as_slices().0);
+        widgets::draw_cpu(
+            frame,
+            rect,
+            snapshot,
+            app.rates.as_ref(),
+            app.history.as_slices().0,
+            app.cursor(Panel::Cpu),
+        );
     }
     if let Some(rect) = computed.memory {
         widgets::draw_memory(frame, rect, snapshot);
     }
     if let Some(rect) = computed.thermal {
-        widgets::draw_thermal(frame, rect, snapshot);
+        widgets::draw_thermal(frame, rect, snapshot, app.cursor(Panel::Thermal));
     }
     if let Some(rect) = computed.disk {
-        widgets::draw_disk(frame, rect, snapshot, app.rates.as_ref());
+        widgets::draw_disk(frame, rect, snapshot, app.rates.as_ref(), app.cursor(Panel::Disk));
     }
     if let Some(rect) = computed.net {
-        widgets::draw_net(frame, rect, snapshot, app.rates.as_ref());
+        widgets::draw_net(frame, rect, snapshot, app.rates.as_ref(), app.cursor(Panel::Net));
     }
     if let Some(rect) = computed.gpu {
-        widgets::draw_gpu(frame, rect, snapshot);
+        widgets::draw_gpu(frame, rect, snapshot, app.cursor(Panel::Gpu));
     }
     if let Some(rect) = computed.connections {
         widgets::draw_connections(
@@ -156,7 +163,7 @@ fn draw_frame(frame: &mut Frame, app: &App) {
             rect,
             snapshot,
             &app.connections_rows(),
-            app.connections_cursor,
+            app.cursor(Panel::Connections),
             &app.enrichment,
         );
     }

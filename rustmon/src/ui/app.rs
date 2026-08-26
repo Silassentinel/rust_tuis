@@ -28,8 +28,9 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::delta::{RateTracker, Rates};
 use crate::error::Result;
-use crate::sample::{ConnProtocol, Connection, Snapshot};
+use crate::sample::{ConnProtocol, Connection, GpuSample, GpuVendor, Snapshot, TempSeverity, ThermalSample};
 use crate::sysfs::{sanitize_kernel_string, SysfsReader};
+use crate::units::{Bytes, Percent};
 
 /// Cap on the hostname/kernel-release strings read once at startup. Both are
 /// always short in practice; this is the same defensive cap every other
@@ -37,7 +38,7 @@ use crate::sysfs::{sanitize_kernel_string, SysfsReader};
 const MAX_IDENTITY_LEN: usize = 256;
 
 /// Which panel has focus, for scrolling and detail views.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Panel {
     #[default]
     Overview,
@@ -367,6 +368,74 @@ enum EnrichmentUpdate {
     Route(IpAddr, Option<Vec<crate::net_probe::traceroute::Hop>>),
 }
 
+/// One visible row in the Thermal panel — a chip's own header line, or one
+/// of its sensor lines. A chip renders a variable number of lines (one
+/// header, one per temp, one per fan), so the row *count* can't be
+/// derived independently of the row *content* — [`App::scrollable_len`]
+/// and [`crate::ui::widgets::draw_thermal`] both call [`thermal_rows`]
+/// rather than each keeping their own count, so they can never drift out
+/// of sync with each other.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThermalRow {
+    ChipHeader { name: String },
+    Temp { label: String, celsius: f64, severity: TempSeverity },
+    Fan { label: String, rpm: u64 },
+}
+
+/// Flatten a [`ThermalSample`] into display rows — one push per chip
+/// header, temp sensor, and fan, in that order per chip, matching exactly
+/// what `draw_thermal` rendered inline before this chunk.
+pub fn thermal_rows(thermal: Option<&ThermalSample>) -> Vec<ThermalRow> {
+    let Some(thermal) = thermal else { return Vec::new() };
+    let mut rows = Vec::new();
+    for chip in &thermal.chips {
+        rows.push(ThermalRow::ChipHeader { name: chip.name.clone() });
+        for t in &chip.temps {
+            rows.push(ThermalRow::Temp {
+                label: t.label.clone(),
+                celsius: t.value.as_celsius(),
+                severity: t.severity(),
+            });
+        }
+        for f in &chip.fans {
+            rows.push(ThermalRow::Fan { label: f.label.clone(), rpm: f.rpm.as_u64() });
+        }
+    }
+    rows
+}
+
+/// One visible row in the GPU panel — same reasoning as [`ThermalRow`]: a
+/// card renders a header plus a variable number of conditional lines
+/// (vram/temp/freq, each present only if that reading exists), so the row
+/// count is derived from [`gpu_rows`] rather than duplicated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuRow {
+    Header { name: String, vendor: GpuVendor, busy: Option<Percent> },
+    Vram { used: Bytes, total: Bytes },
+    Temp { celsius: f64 },
+    Freq { ghz: f64 },
+}
+
+/// Flatten a [`GpuSample`] into display rows, matching exactly what
+/// `draw_gpu` rendered inline before this chunk.
+pub fn gpu_rows(gpu: Option<&GpuSample>) -> Vec<GpuRow> {
+    let Some(gpu) = gpu else { return Vec::new() };
+    let mut rows = Vec::new();
+    for g in &gpu.gpus {
+        rows.push(GpuRow::Header { name: g.name.clone(), vendor: g.vendor, busy: g.busy });
+        if let (Some(used), Some(total)) = (g.vram_used, g.vram_total) {
+            rows.push(GpuRow::Vram { used, total });
+        }
+        if let Some(t) = g.temp {
+            rows.push(GpuRow::Temp { celsius: t.as_celsius() });
+        }
+        if let Some(f) = g.freq_khz {
+            rows.push(GpuRow::Freq { ghz: f.as_ghz() });
+        }
+    }
+    rows
+}
+
 /// Everything the UI needs between frames.
 pub struct App {
     pub config: Config,
@@ -397,8 +466,10 @@ pub struct App {
     pub hostname: String,
     pub kernel: String,
 
-    /// Which row is highlighted in the connections panel.
-    pub connections_cursor: usize,
+    /// Which row is highlighted in each scrollable panel, keyed by panel so
+    /// each remembers its own position independently across `Tab`
+    /// switches. Absent from the map means row `0` — see [`Self::cursor`].
+    pub panel_cursor: HashMap<Panel, usize>,
     /// Which rows are checkbox-marked for enrichment, keyed by row
     /// identity rather than index — see [`ConnKey`].
     pub connections_checked: HashSet<ConnKey>,
@@ -442,7 +513,7 @@ impl App {
             should_quit: false,
             hostname,
             kernel,
-            connections_cursor: 0,
+            panel_cursor: HashMap::new(),
             connections_checked: HashSet::new(),
             connections_collapsed: HashSet::new(),
             enrichment: HashMap::new(),
@@ -468,20 +539,50 @@ impl App {
         self.history.make_contiguous();
 
         self.current = Some(snapshot);
-        self.clamp_connections_cursor();
+        // Every panel's cursor is clamped here, not just the focused one —
+        // a panel's data can shrink while it's in the background (fewer
+        // connections, a sensor disappearing), and clamping only on focus
+        // change would let a stale out-of-range cursor sit there until the
+        // user actually tabs to it.
+        for panel in Panel::ALL {
+            self.clamp_cursor(panel);
+        }
         self.last_refresh = Instant::now();
         Ok(())
     }
 
-    /// The connection list is ephemeral (sockets open and close every
-    /// refresh), and collapsing/expanding a process group changes the
-    /// visible row count without a new snapshot — either can leave the
-    /// cursor past the end of a shorter row list, so this clamps it. Called
-    /// from [`Self::refresh`] and from [`Self::collapse_cursor_row`]/
-    /// [`Self::expand_cursor_row`] rather than at every read site.
-    fn clamp_connections_cursor(&mut self) {
-        let len = self.connections_rows().len();
-        self.connections_cursor = if len == 0 { 0 } else { self.connections_cursor.min(len - 1) };
+    /// Current cursor row for `panel` — `0` if it's never been moved.
+    pub fn cursor(&self, panel: Panel) -> usize {
+        *self.panel_cursor.get(&panel).unwrap_or(&0)
+    }
+
+    /// How many rows `panel` currently has to scroll over. `0` for
+    /// `Overview`/`Memory` (gauges only, nothing to scroll) and for any
+    /// panel with no data collected yet.
+    fn scrollable_len(&self, panel: Panel) -> usize {
+        let Some(snapshot) = &self.current else { return 0 };
+        match panel {
+            Panel::Overview | Panel::Memory => 0,
+            Panel::Cpu => snapshot.cpu.as_ref().map(|c| c.freq_khz.len()).unwrap_or(0),
+            Panel::Thermal => thermal_rows(snapshot.thermal.as_ref()).len(),
+            Panel::Disk => snapshot.disks.as_ref().map(|d| d.devices.len()).unwrap_or(0),
+            Panel::Net => snapshot.net.as_ref().map(|n| n.interfaces.len()).unwrap_or(0),
+            Panel::Gpu => gpu_rows(snapshot.gpus.as_ref()).len(),
+            Panel::Connections => self.connections_rows().len(),
+        }
+    }
+
+    /// A panel's row list is ephemeral (sockets open and close, sensors can
+    /// disappear, the connections tree can grow/shrink when a group is
+    /// collapsed/expanded) — this clamps its cursor back into range rather
+    /// than requiring every call site to remember to. Called from
+    /// [`Self::refresh`] for every panel, and from
+    /// [`Self::collapse_cursor_row`]/[`Self::expand_cursor_row`] for the
+    /// one panel whose row count they just changed.
+    fn clamp_cursor(&mut self, panel: Panel) {
+        let len = self.scrollable_len(panel);
+        let clamped = if len == 0 { 0 } else { self.cursor(panel).min(len - 1) };
+        self.panel_cursor.insert(panel, clamped);
     }
 
     /// Handle one key press.
@@ -489,18 +590,20 @@ impl App {
     /// Bindings: `q`/`Esc` quit, `Tab`/`Shift-Tab` cycle panels, `1`-`7` jump
     /// to a panel, `space` pause, `r` reset the rate tracker, `?` help,
     /// `+`/`-` adjust the interval (clamped to [`crate::config::MIN_INTERVAL`]).
-    /// With the connections panel focused: `Up`/`Down` move the row cursor,
-    /// `x` toggles the cursor row's checkbox (a process row toggles every
-    /// connection in its whole subtree at once), `Left`/`Right`
-    /// collapse/expand the cursor row's process group, `Enter` resolves
-    /// every checked row's remote IP (see [`Self::resolve_checked`]).
+    /// `Up`/`Down` scroll whichever panel currently has focus (a no-op on
+    /// `Overview`/`Memory`, which have nothing to scroll). With the
+    /// connections panel focused specifically: `x` toggles the cursor
+    /// row's checkbox (a process row toggles every connection in its whole
+    /// subtree at once), `Left`/`Right` collapse/expand the cursor row's
+    /// process group, `Enter` resolves every checked row's remote IP (see
+    /// [`Self::resolve_checked`]).
     pub fn on_key(&mut self, key: KeyPress) -> Result<()> {
         match key {
             KeyPress::CtrlC | KeyPress::Esc => self.should_quit = true,
             KeyPress::Tab => self.focus = self.focus.next(),
             KeyPress::BackTab => self.focus = self.focus.prev(),
-            KeyPress::Up if self.focus == Panel::Connections => self.move_connections_cursor(-1),
-            KeyPress::Down if self.focus == Panel::Connections => self.move_connections_cursor(1),
+            KeyPress::Up => self.move_cursor(-1),
+            KeyPress::Down => self.move_cursor(1),
             KeyPress::Left if self.focus == Panel::Connections => self.collapse_cursor_row(),
             KeyPress::Right if self.focus == Panel::Connections => self.expand_cursor_row(),
             KeyPress::Enter if self.focus == Panel::Connections => self.resolve_checked(),
@@ -532,16 +635,18 @@ impl App {
         Ok(())
     }
 
-    /// Move the connections-panel row cursor by `delta`, wrapping — a no-op
-    /// if there's no connection data (or none) to move a cursor over.
-    fn move_connections_cursor(&mut self, delta: isize) {
-        let len = self.connections_rows().len();
+    /// Move the focused panel's row cursor by `delta`, wrapping — a no-op
+    /// if that panel has nothing to scroll over
+    /// ([`Self::scrollable_len`] is `0`).
+    fn move_cursor(&mut self, delta: isize) {
+        let panel = self.focus;
+        let len = self.scrollable_len(panel);
         if len == 0 {
-            self.connections_cursor = 0;
+            self.panel_cursor.insert(panel, 0);
             return;
         }
-        let next = (self.connections_cursor as isize + delta).rem_euclid(len as isize);
-        self.connections_cursor = next as usize;
+        let next = (self.cursor(panel) as isize + delta).rem_euclid(len as isize);
+        self.panel_cursor.insert(panel, next as usize);
     }
 
     /// Toggle the cursor row's checkbox. On a [`ConnRow::Connection`] this
@@ -554,7 +659,7 @@ impl App {
     /// them all.
     fn toggle_checked(&mut self) {
         let rows = self.connections_rows();
-        let Some(row) = rows.get(self.connections_cursor) else { return };
+        let Some(row) = rows.get(self.cursor(Panel::Connections)) else { return };
         let Some(sample) = self.current.as_ref().and_then(|s| s.connections.as_ref()) else { return };
 
         match row {
@@ -587,18 +692,18 @@ impl App {
     /// Collapse the cursor row's process group — a no-op on a `Connection`
     /// row or a row that isn't currently the cursor's.
     fn collapse_cursor_row(&mut self) {
-        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.connections_cursor) {
+        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.cursor(Panel::Connections)) {
             self.connections_collapsed.insert(*pid);
         }
-        self.clamp_connections_cursor();
+        self.clamp_cursor(Panel::Connections);
     }
 
     /// Expand the cursor row's process group.
     fn expand_cursor_row(&mut self) {
-        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.connections_cursor) {
+        if let Some(ConnRow::Process { pid, .. }) = self.connections_rows().get(self.cursor(Panel::Connections)) {
             self.connections_collapsed.remove(pid);
         }
-        self.clamp_connections_cursor();
+        self.clamp_cursor(Panel::Connections);
     }
 
     /// The connections panel's current process tree, flattened into display
@@ -1003,6 +1108,12 @@ mod tests {
         app
     }
 
+    fn app_with_snapshot(snapshot: Snapshot) -> App {
+        let mut app = App::new(test_config()).expect("constructs");
+        app.current = Some(snapshot);
+        app
+    }
+
     fn fake_owned_connection(pid: u32, ppid: Option<u32>, program: &str, remote_port: u16) -> Connection {
         Connection { pid: Some(pid), ppid, program: Some(program.to_string()), ..fake_connection(remote_port) }
     }
@@ -1013,19 +1124,163 @@ mod tests {
         app.focus = Panel::Connections;
 
         app.on_key(KeyPress::Up).unwrap();
-        assert_eq!(app.connections_cursor, 2, "moving up from 0 must wrap to the last row");
+        assert_eq!(app.cursor(Panel::Connections), 2, "moving up from 0 must wrap to the last row");
         app.on_key(KeyPress::Down).unwrap();
-        assert_eq!(app.connections_cursor, 0);
+        assert_eq!(app.cursor(Panel::Connections), 0);
         app.on_key(KeyPress::Down).unwrap();
-        assert_eq!(app.connections_cursor, 1);
+        assert_eq!(app.cursor(Panel::Connections), 1);
     }
 
     #[test]
-    fn cursor_movement_is_ignored_outside_the_connections_panel() {
+    fn cursor_movement_only_affects_the_focused_panels_own_cursor() {
         let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2)]);
-        // focus stays at its default (Overview).
+        // focus stays at its default (Overview), which has nothing to
+        // scroll — Down must neither move Overview's cursor nor bleed
+        // into Connections', even though Connections has real rows.
         app.on_key(KeyPress::Down).unwrap();
-        assert_eq!(app.connections_cursor, 0, "Up/Down must be inert outside the connections panel");
+        assert_eq!(app.cursor(Panel::Overview), 0);
+        assert_eq!(app.cursor(Panel::Connections), 0, "Down while unfocused must not move a different panel's cursor");
+    }
+
+    // ---- generalized scrolling: every list/table panel, not just Connections ---
+
+    /// Cpu (3 cores), Thermal (1 chip header + 2 temps), Disk (3 devices),
+    /// Net (3 interfaces), and Gpu (1 header + vram + temp) each real
+    /// enough to prove `scrollable_len` is wired to the right count per
+    /// panel — Thermal/Gpu in particular, since their row count comes from
+    /// `thermal_rows`/`gpu_rows`, not a plain `.len()` on the snapshot.
+    fn full_scrollable_snapshot() -> Snapshot {
+        let mut s = Snapshot::now();
+        s.cpu = Some(crate::sample::CpuSample {
+            total: crate::sample::CpuTimes::default(),
+            per_core: vec![],
+            freq_khz: vec![None, None, None],
+            load_avg: None,
+            model: None,
+            ctxt: None,
+            btime: None,
+        });
+        s.thermal = Some(ThermalSample {
+            chips: vec![crate::sample::HwmonChip {
+                name: "chip0".to_string(),
+                temps: vec![
+                    crate::sample::TempSensor {
+                        label: "t1".to_string(),
+                        value: crate::units::MilliCelsius::from_millidegrees(1000),
+                        max: None,
+                        crit: None,
+                    },
+                    crate::sample::TempSensor {
+                        label: "t2".to_string(),
+                        value: crate::units::MilliCelsius::from_millidegrees(2000),
+                        max: None,
+                        crit: None,
+                    },
+                ],
+                fans: vec![],
+            }],
+        });
+        s.disks = Some(crate::sample::DiskSample {
+            devices: ["sda", "sdb", "sdc"]
+                .into_iter()
+                .map(|name| crate::sample::DiskDevice {
+                    name: name.to_string(),
+                    reads_completed: 0,
+                    writes_completed: 0,
+                    sectors_read: 0,
+                    sectors_written: 0,
+                    io_ticks_ms: 0,
+                })
+                .collect(),
+            mounts: vec![],
+        });
+        s.net = Some(crate::sample::NetSample {
+            interfaces: ["eth0", "eth1", "eth2"]
+                .into_iter()
+                .map(|name| crate::sample::NetInterface {
+                    name: name.to_string(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_packets: 0,
+                    tx_packets: 0,
+                    rx_errors: 0,
+                    tx_errors: 0,
+                    rx_dropped: 0,
+                    tx_dropped: 0,
+                    operstate: None,
+                    mtu: None,
+                })
+                .collect(),
+        });
+        s.gpus = Some(GpuSample {
+            gpus: vec![crate::sample::Gpu {
+                vendor: GpuVendor::Amd,
+                name: "card0".to_string(),
+                busy: None,
+                vram_total: Some(Bytes::from_bytes(100)),
+                vram_used: Some(Bytes::from_bytes(50)),
+                temp: Some(crate::units::MilliCelsius::from_millidegrees(1000)),
+                power: None,
+                fan_rpm: None,
+                freq_khz: None,
+            }],
+        });
+        s
+    }
+
+    #[test]
+    fn every_scrollable_panel_wraps_against_its_own_real_row_count() {
+        let mut app = app_with_snapshot(full_scrollable_snapshot());
+        for (panel, expected_len) in [
+            (Panel::Cpu, 3),     // 3 cores
+            (Panel::Thermal, 3), // 1 chip header + 2 temps
+            (Panel::Disk, 3),    // 3 devices
+            (Panel::Net, 3),     // 3 interfaces
+            (Panel::Gpu, 3),     // 1 header + vram + temp
+        ] {
+            app.focus = panel;
+            app.panel_cursor.insert(panel, 0);
+            app.on_key(KeyPress::Up).unwrap();
+            assert_eq!(app.cursor(panel), expected_len - 1, "{panel:?} moving up from 0 must wrap to the last row");
+            app.on_key(KeyPress::Down).unwrap();
+            assert_eq!(app.cursor(panel), 0, "{panel:?} must wrap back down to 0");
+        }
+    }
+
+    #[test]
+    fn overview_and_memory_have_nothing_to_scroll() {
+        let mut app = app_with_snapshot(full_scrollable_snapshot());
+        for panel in [Panel::Overview, Panel::Memory] {
+            app.focus = panel;
+            app.on_key(KeyPress::Down).unwrap();
+            assert_eq!(app.cursor(panel), 0, "{panel:?} has nothing to scroll");
+        }
+    }
+
+    #[test]
+    fn clamp_cursor_generalizes_to_every_panel_not_just_connections() {
+        let mut app = app_with_snapshot(full_scrollable_snapshot());
+        app.panel_cursor.insert(Panel::Cpu, 2);
+
+        app.current.as_mut().unwrap().cpu.as_mut().unwrap().freq_khz = vec![None];
+        app.clamp_cursor(Panel::Cpu);
+        assert_eq!(app.cursor(Panel::Cpu), 0, "cursor must be pulled back when the core count shrinks");
+    }
+
+    #[test]
+    fn refresh_clamps_every_panels_cursor_not_just_the_focused_one() {
+        let mut config = test_config();
+        config.sysfs_root = std::env::temp_dir();
+        let mut app = App::new(config).expect("constructs");
+        app.current = Some(full_scrollable_snapshot());
+        app.panel_cursor.insert(Panel::Cpu, 2);
+        app.focus = Panel::Thermal; // Cpu is in the background, unfocused
+
+        app.refresh().expect("refresh against a real sysfs_root must not fail");
+        // The real collector run replaces `current` with fresh (likely
+        // absent, under a temp-dir sysfs_root) data — Cpu's stale cursor
+        // must not survive pointing at a snapshot that no longer exists.
+        assert_eq!(app.cursor(Panel::Cpu), 0);
     }
 
     #[test]
@@ -1108,25 +1363,25 @@ mod tests {
     }
 
     #[test]
-    fn clamp_connections_cursor_pulls_the_cursor_back_when_the_list_shrinks() {
+    fn clamp_cursor_pulls_the_cursor_back_when_the_list_shrinks() {
         let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2), fake_connection(3)]);
-        app.connections_cursor = 2;
+        app.panel_cursor.insert(Panel::Connections, 2);
 
         app.current.as_mut().unwrap().connections = Some(crate::sample::ConnectionSample {
             connections: vec![fake_connection(1)],
         });
-        app.clamp_connections_cursor();
-        assert_eq!(app.connections_cursor, 0);
+        app.clamp_cursor(Panel::Connections);
+        assert_eq!(app.cursor(Panel::Connections), 0);
     }
 
     #[test]
-    fn clamp_connections_cursor_resets_to_zero_when_the_list_becomes_empty() {
+    fn clamp_cursor_resets_to_zero_when_the_list_becomes_empty() {
         let mut app = app_with_connections(vec![fake_connection(1), fake_connection(2)]);
-        app.connections_cursor = 1;
+        app.panel_cursor.insert(Panel::Connections, 1);
 
         app.current.as_mut().unwrap().connections = Some(crate::sample::ConnectionSample { connections: vec![] });
-        app.clamp_connections_cursor();
-        assert_eq!(app.connections_cursor, 0);
+        app.clamp_cursor(Panel::Connections);
+        assert_eq!(app.cursor(Panel::Connections), 0);
     }
 
     // ---- connections panel: process tree ---------------------------------------
@@ -1195,7 +1450,7 @@ mod tests {
         app.focus = Panel::Connections;
         assert_eq!(app.connections_rows().len(), 4);
 
-        app.connections_cursor = 0; // the pid-100 header
+        app.panel_cursor.insert(Panel::Connections, 0); // the pid-100 header
         app.on_key(KeyPress::Left).unwrap();
         let rows = app.connections_rows();
         assert_eq!(rows, vec![ConnRow::Process {
@@ -1216,7 +1471,7 @@ mod tests {
         app.connections_collapsed.insert(42);
         assert_eq!(app.connections_rows().len(), 1, "collapsed: header only");
 
-        app.connections_cursor = 0;
+        app.panel_cursor.insert(Panel::Connections, 0);
         app.on_key(KeyPress::Right).unwrap();
         assert_eq!(app.connections_rows().len(), 2, "expanded: header + its connection");
     }
@@ -1225,7 +1480,7 @@ mod tests {
     fn left_and_right_are_no_ops_on_a_connection_row() {
         let mut app = app_with_connections(vec![fake_connection(1)]);
         app.focus = Panel::Connections;
-        app.connections_cursor = 0; // the only row, a flat unattributed Connection
+        app.panel_cursor.insert(Panel::Connections, 0); // the only row, a flat unattributed Connection
         app.on_key(KeyPress::Left).unwrap();
         app.on_key(KeyPress::Right).unwrap();
         assert!(app.connections_collapsed.is_empty());
@@ -1238,7 +1493,7 @@ mod tests {
             fake_owned_connection(200, Some(100), "app", 2),
         ]);
         app.focus = Panel::Connections;
-        app.connections_cursor = 0; // the pid-100 header, whose subtree includes pid 200
+        app.panel_cursor.insert(Panel::Connections, 0); // the pid-100 header, whose subtree includes pid 200
 
         app.on_key(KeyPress::Char('x')).unwrap();
         assert_eq!(app.connections_checked.len(), 2, "both connections in the subtree must be checked");
