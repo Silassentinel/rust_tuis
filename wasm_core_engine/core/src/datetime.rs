@@ -72,6 +72,21 @@ impl DateTime {
         NAMES[idx]
     }
 
+    pub fn weekday_long(&self) -> &'static str {
+        const NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+        let days = days_from_civil(self.year, self.month, self.day);
+        let idx = (((days % 7) + 7 + 4) % 7) as usize;
+        NAMES[idx]
+    }
+
+    pub fn month_long(&self) -> &'static str {
+        const NAMES: [&str; 12] = [
+            "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+            "November", "December",
+        ];
+        NAMES[(self.month - 1) as usize]
+    }
+
     pub fn time_24h(&self) -> String {
         format!("{:02}:{:02}", self.hour, self.minute)
     }
@@ -171,6 +186,19 @@ mod tests {
     #[test]
     fn epoch_day_is_a_thursday() {
         assert_eq!(DateTime::new(1970, 1, 1, 0, 0).weekday_short(), "Thu");
+    }
+
+    #[test]
+    fn weekday_long_spells_out_the_full_name() {
+        assert_eq!(DateTime::new(1970, 1, 1, 0, 0).weekday_long(), "Thursday");
+        assert_eq!(DateTime::new(2026, 9, 25, 0, 0).weekday_long(), "Friday");
+    }
+
+    #[test]
+    fn month_long_spells_out_the_full_name() {
+        assert_eq!(DateTime::new(2026, 1, 1, 0, 0).month_long(), "January");
+        assert_eq!(DateTime::new(2026, 9, 1, 0, 0).month_long(), "September");
+        assert_eq!(DateTime::new(2026, 12, 1, 0, 0).month_long(), "December");
     }
 
     #[test]

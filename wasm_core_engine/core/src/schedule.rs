@@ -131,7 +131,19 @@ pub fn format_due(next_due: DateTime, now: DateTime) -> DueInfo {
         if next_due.same_calendar_day(&tomorrow) {
             format!("Tomorrow, {time}")
         } else {
-            format!("{}, in {}d", next_due.weekday_short(), diff_days.ceil() as i64)
+            // Flagged deviation from the source: `formatDue` always uses
+            // `weekday: 'short'` here (e.g. "Fri, in 23d"), which reads
+            // fine as long as a due date is always within the coming
+            // week — true for every cadence the source ever had
+            // (`daily`/`weekly`). `Cadence::Monthly` breaks that
+            // assumption: a bare weekday name for a date weeks out reads
+            // as "this coming {weekday}" and is actively misleading (a
+            // live example: today Wed 2026-09-02, due date the Friday
+            // three and a half weeks later, showed "next Fri, in 23d" —
+            // easily misread as this week's Friday, two days out). The
+            // full weekday + day + month spells out an unambiguous date
+            // regardless of how far out it is.
+            format!("{} {} {}, in {}d", next_due.weekday_long(), next_due.day, next_due.month_long(), diff_days.ceil() as i64)
         }
     };
 
@@ -303,6 +315,18 @@ mod tests {
             assert_eq!(result.status_text, "on track");
             assert!(result.due.ends_with('d') && result.due.contains("in "));
             assert!(result.due_days.unwrap() > 1.0, "{:?}", result.due_days);
+        }
+
+        // Regression: a bare short weekday name ("Fri, in 23d") reads as
+        // "this coming Friday" and is actively misleading once a due
+        // date can be weeks out (Cadence::Monthly) - the full weekday +
+        // day + month spells out an unambiguous date. Live example: from
+        // 2026-09-02 (a Wednesday), a monthly-cadence due date of
+        // 2026-09-25 (a Friday) is 23 days out, not "next Friday."
+        #[test]
+        fn spells_out_the_full_date_for_a_due_date_far_in_the_future() {
+            let result = format_due(dt(2026, 9, 25, 13, 0), dt(2026, 9, 2, 13, 0));
+            assert_eq!(result.due, "Friday 25 September, in 23d");
         }
 
         // Regression test for sorting by urgency: due_days must order the
