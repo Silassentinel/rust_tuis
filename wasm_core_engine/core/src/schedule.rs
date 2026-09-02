@@ -1,7 +1,12 @@
-//! Recurring cadence (daily/weekly) + due-date derivation. Ported from
-//! `formatCadence`/`computeNextDue`/`formatDue` in
+//! Recurring cadence (daily/weekly/monthly) + due-date derivation. Ported
+//! from `formatCadence`/`computeNextDue`/`formatDue` in
 //! `website/features/ferment-tracker-app/server/fermentData.ts`. A
 //! cadence/schedule concept is generic, not tied to any one domain.
+//!
+//! `Cadence::Monthly` is a Rust-only extension beyond the ported source
+//! (which only ever has `'daily' | 'weekly'`) — see `raw_tracker.rs`'s
+//! doc comment in `ferment_tracker_core` for the same posture already
+//! established by `FieldKind::TrackerRef`.
 
 use crate::datetime::DateTime;
 
@@ -9,6 +14,7 @@ use crate::datetime::DateTime;
 pub enum Cadence {
     Daily,
     Weekly,
+    Monthly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +77,14 @@ pub fn format_cadence(schedule: &Schedule) -> String {
             };
             join_non_empty(&[Some(freq), schedule.time.clone()], " \u{b7} ")
         }
+        Cadence::Monthly => {
+            let freq = if schedule.interval == 1 {
+                "monthly".to_string()
+            } else {
+                format!("every {} months", schedule.interval)
+            };
+            join_non_empty(&[Some(freq), schedule.time.clone()], " \u{b7} ")
+        }
     }
 }
 
@@ -87,11 +101,12 @@ fn parse_hh_mm(time: &str) -> (u32, u32) {
 pub fn compute_next_due(schedule: &Schedule, last_date: Option<DateTime>, created: DateTime) -> DateTime {
     let base = last_date.unwrap_or(created);
     let (hh, mm) = parse_hh_mm(schedule.time.as_deref().unwrap_or("09:00"));
-    let days_to_add = match schedule.cadence {
-        Cadence::Weekly => i64::from(schedule.interval) * 7,
-        Cadence::Daily => i64::from(schedule.interval),
+    let next = match schedule.cadence {
+        Cadence::Weekly => base.add_days(i64::from(schedule.interval) * 7),
+        Cadence::Daily => base.add_days(i64::from(schedule.interval)),
+        Cadence::Monthly => base.add_months(i64::from(schedule.interval)),
     };
-    base.add_days(days_to_add).with_time(hh, mm)
+    next.with_time(hh, mm)
 }
 
 pub fn format_due(next_due: DateTime, now: DateTime) -> DueInfo {
@@ -194,6 +209,21 @@ mod tests {
 
             let weekly = Schedule { cadence: Cadence::Weekly, interval: 1, time: None, day_of_week: None };
             assert_eq!(format_cadence(&weekly), "weekly");
+
+            let monthly = Schedule { cadence: Cadence::Monthly, interval: 1, time: None, day_of_week: None };
+            assert_eq!(format_cadence(&monthly), "monthly");
+        }
+
+        #[test]
+        fn says_monthly_rather_than_every_1_months() {
+            let s = Schedule { cadence: Cadence::Monthly, interval: 1, time: Some("13:00".to_string()), day_of_week: None };
+            assert_eq!(format_cadence(&s), "monthly \u{b7} 13:00");
+        }
+
+        #[test]
+        fn spells_out_multi_month_intervals() {
+            let monthly = Schedule { cadence: Cadence::Monthly, interval: 3, time: Some("09:00".to_string()), day_of_week: None };
+            assert_eq!(format_cadence(&monthly), "every 3 months \u{b7} 09:00");
         }
     }
 
@@ -220,6 +250,24 @@ mod tests {
             let schedule = Schedule { cadence: Cadence::Weekly, interval: 2, time: Some("09:00".to_string()), day_of_week: None };
             let next = compute_next_due(&schedule, Some(dt(2026, 7, 1, 0, 0)), dt(2026, 1, 1, 0, 0));
             assert_eq!(next.day, 15);
+        }
+
+        #[test]
+        fn adds_whole_months_for_a_monthly_cadence() {
+            let schedule = Schedule { cadence: Cadence::Monthly, interval: 2, time: Some("09:00".to_string()), day_of_week: None };
+            let next = compute_next_due(&schedule, Some(dt(2026, 1, 1, 0, 0)), dt(2026, 1, 1, 0, 0));
+            assert_eq!((next.year, next.month, next.day), (2026, 3, 1));
+        }
+
+        // Regression: a monthly cadence stepping from a last check-in on
+        // the 31st into a shorter month must clamp (see
+        // `DateTime::add_months`), not silently roll into the wrong
+        // month or panic.
+        #[test]
+        fn clamps_a_monthly_due_date_when_the_last_checkin_day_overflows_the_next_month() {
+            let schedule = Schedule { cadence: Cadence::Monthly, interval: 1, time: Some("13:00".to_string()), day_of_week: None };
+            let next = compute_next_due(&schedule, Some(dt(2026, 1, 31, 0, 0)), dt(2026, 1, 1, 0, 0));
+            assert_eq!((next.year, next.month, next.day, next.hour), (2026, 2, 28, 13));
         }
     }
 
