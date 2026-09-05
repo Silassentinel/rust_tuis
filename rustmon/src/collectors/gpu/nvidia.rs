@@ -60,7 +60,7 @@ impl NvmlSession {
     }
 
     /// Read one device's metrics: utilisation, VRAM, temperature, power, fan.
-    pub fn read_device(&self, index: u32) -> Result<Option<Gpu>> {
+    pub fn read_device(&self, _index: u32) -> Result<Option<Gpu>> {
         todo!("BLOCKED on crate proposal 'rustmon C'")
     }
 }
@@ -78,6 +78,6 @@ pub fn read(_card: &str) -> Result<Option<Gpu>> {
 
 /// Feature-enabled variant. Requires an initialised [`NvmlSession`].
 #[cfg(feature = "gpu-nvidia")]
-pub fn read(session: Option<&NvmlSession>, index: u32) -> Result<Option<Gpu>> {
+pub fn read(_session: Option<&NvmlSession>, _index: u32) -> Result<Option<Gpu>> {
     todo!("BLOCKED on crate proposal 'rustmon C'")
 }
