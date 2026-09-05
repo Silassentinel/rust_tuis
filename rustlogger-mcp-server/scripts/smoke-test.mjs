@@ -44,7 +44,15 @@ async function main() {
     throw new Error(`${SERVER_JS} not found - run "npm run build" first`);
   }
 
-  const transport = new StdioClientTransport({ command: "node", args: [SERVER_JS] });
+  // This test exercises "bash" and "sleep" below. Since RUSTLOGGER_MCP_ALLOWED_COMMANDS
+  // is required by default (see src/policy.ts), pass an explicit allowlist covering
+  // exactly those rather than opting out of the allowlist entirely - the smoke test
+  // should demonstrate the recommended (restricted) configuration, not the escape hatch.
+  const transport = new StdioClientTransport({
+    command: "node",
+    args: [SERVER_JS],
+    env: { ...process.env, RUSTLOGGER_MCP_ALLOWED_COMMANDS: "bash,sleep" },
+  });
   const client = new Client({ name: "smoke-test-client", version: "1.0.0" });
   await client.connect(transport);
 

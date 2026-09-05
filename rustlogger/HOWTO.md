@@ -162,10 +162,17 @@ rustlogger's own `=== rustlogger session ended … ===` / `reason:` /
 **Safe:**
 
 ```bash
-cat -v rustlogger-*.log      # renders escapes as visible text (^[ etc.)
+rustlogger --view rustlogger-20260723-143207.log   # renders escapes as visible text (^[ etc.)
+cat -v rustlogger-*.log      # same idea, if you'd rather not name the exact file
 less rustlogger-*.log        # without -R, less escapes control chars itself
 grep something rustlogger-*.log
 ```
+
+`rustlogger --view <path>` exists so you don't have to remember the `-v`/no-
+`-R` rule under time pressure — it's the same rendering (caret notation:
+`ESC` → `^[`, a bare `CR` → `^M`, high-bit bytes get an `M-` prefix), built
+in rather than left to `cat` folklore. It only reads and renders the file;
+it never wraps a shell or writes anything.
 
 **Unsafe on a log you don't fully trust:**
 

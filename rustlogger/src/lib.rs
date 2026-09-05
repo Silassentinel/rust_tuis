@@ -13,6 +13,7 @@
 
 pub mod logfile;
 pub mod pty_session;
+pub mod safe_view;
 pub mod session;
 pub mod signals;
 pub mod stop_trigger;

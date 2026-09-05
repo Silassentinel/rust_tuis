@@ -65,22 +65,26 @@ to do it elsewhere:
 }
 ```
 
-## Restricting what can be run (optional)
+## Restricting what can be run
 
-This server's job is to run programs, so by default it will run whatever it
-is asked to. That is fine when the only thing driving it is you — but if the
-agent using it ever relays untrusted content (a web page, an issue, a file
-someone else wrote), a prompt injection becomes arbitrary code execution on
-this machine, detached and outliving the conversation.
+This server's job is to run programs — but if the agent using it ever relays
+untrusted content (a web page, an issue, a file someone else wrote), a prompt
+injection becomes arbitrary code execution on this machine, detached and
+outliving the conversation. Because of that, **a command allowlist is
+required by default**: with nothing configured, every `start_tracking` call
+is refused. `cwd` confinement stays opt-in (see table below), since on its
+own it's a lower-severity, defense-in-depth control.
 
-Two opt-in environment variables narrow that. Both are read from the
-*server's* environment, never from tool inputs, so a client can't widen its
-own permissions. Leave them unset for today's unrestricted behavior.
+Both variables are read from the *server's* environment, never from tool
+inputs, so a client can't widen its own permissions.
 
 | Variable | Effect |
 |---|---|
-| `RUSTLOGGER_MCP_ALLOWED_COMMANDS` | Comma-separated list of permitted commands. A bare name (`npm`) also permits an absolute path with that basename (`/usr/bin/npm`); an absolute-path entry permits only that exact path. Anything else is refused. |
-| `RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS` | Comma-separated absolute directories. A request's `cwd` must resolve (symlinks included) to one of them or below. Also bounds where predictably-named log files can be written. |
+| `RUSTLOGGER_MCP_ALLOWED_COMMANDS` | **Required unless `RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS` is set.** Comma-separated list of permitted commands. A bare name (`npm`) also permits an absolute path with that basename (`/usr/bin/npm`); an absolute-path entry permits only that exact path. Anything else is refused. |
+| `RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS` | Explicit opt-out of the allowlist requirement — set to `1`/`true`/`yes` to restore run-anything behavior. Only do this if nothing driving this server can ever relay untrusted content (e.g. a single-user local setup where you are the only thing calling it). Ignored if `RUSTLOGGER_MCP_ALLOWED_COMMANDS` is also set. |
+| `RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS` | Optional. Comma-separated absolute directories. A request's `cwd` must resolve (symlinks included) to one of them or below. Also bounds where predictably-named log files can be written. Unset = any directory. |
+
+Narrowed to specific commands (recommended for anything agent-driven):
 
 ```json
 {
@@ -92,6 +96,20 @@ own permissions. Leave them unset for today's unrestricted behavior.
         "RUSTLOGGER_MCP_ALLOWED_COMMANDS": "npm,cargo,make",
         "RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS": "/home/you/code"
       }
+    }
+  }
+}
+```
+
+Explicitly unrestricted (only for a trusted single-user local setup):
+
+```json
+{
+  "mcpServers": {
+    "rustlogger": {
+      "command": "node",
+      "args": ["/absolute/path/to/rustlogger-mcp-server/dist/index.js"],
+      "env": { "RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS": "1" }
     }
   }
 }

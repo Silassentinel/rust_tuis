@@ -9,6 +9,9 @@ rustlogger \- wrap the current shell in a pseudo\-terminal and log the whole ses
 .RI [ "\-\-log\-dir " dir ]
 .I command
 .RI [ arg " ...]"
+.br
+.B rustlogger \-\-view
+.I path
 .SH DESCRIPTION
 With no arguments,
 .B rustlogger
@@ -62,6 +65,14 @@ untouched. If both
 and
 .B RUSTLOGGER_LOG_DIR
 are set, this flag wins.
+.TP
+.BI \-\-view\  path
+Print the log at
+.I path
+with control and escape bytes rendered as visible text instead of left for
+your terminal to act on, then exit \(em see
+.B READING A LOG SAFELY
+below. Reads the file only; does not wrap a shell or write anything.
 .SH ENVIRONMENT
 .TP
 .B SHELL
@@ -169,14 +180,15 @@ own
 footer.
 .PP
 Prefer
-.B cat \-v
+.BR "rustlogger \-\-view" ,
+.BR "cat \-v" ,
 or a plain
 .BR less ,
-both of which render control characters as visible text:
+all of which render control characters as visible text:
 .PP
 .RS
 .nf
-cat \-v rustlogger\-*.log
+rustlogger \-\-view rustlogger\-20260723\-143207.log
 .fi
 .RE
 .PP
@@ -249,6 +261,9 @@ Track a build in the background and log it, headlessly:
 .TP
 Track a build, keeping logs out of the repo's own working directory:
 .B rustlogger \-\-log\-dir ~/.rustlogger/logs npm run build
+.TP
+View a log without letting it act on your terminal:
+.B rustlogger \-\-view rustlogger\-20260723\-143207.log
 .SH LIMITATIONS
 .IP \(bu 2
 Linux only.

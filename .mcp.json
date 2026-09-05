@@ -2,7 +2,10 @@
   "mcpServers": {
     "rustlogger": {
       "command": "node",
-      "args": ["rustlogger-mcp-server/dist/index.js"]
+      "args": ["rustlogger-mcp-server/dist/index.js"],
+      "env": {
+        "RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS": "1"
+      }
     }
   }
 }

@@ -133,6 +133,28 @@ fn read_the_log_file(dir: &std::path::Path) -> String {
     fs::read_to_string(logs.remove(0)).expect("failed to read log file")
 }
 
+/// Same lookup as `read_the_log_file`, but returns the path instead of
+/// its contents - for tests that need to hand the file to a second
+/// `rustlogger` invocation (`--view`) rather than read it directly.
+fn find_the_log_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut logs: Vec<_> = fs::read_dir(dir)
+        .expect("failed to read scratch dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("rustlogger-") && name.ends_with(".log")
+        })
+        .collect();
+
+    assert_eq!(
+        logs.len(),
+        1,
+        "expected exactly one rustlogger-*.log file in {dir:?}, found {logs:?}"
+    );
+    logs.remove(0)
+}
+
 #[test]
 fn wraps_a_short_shell_session_and_logs_it() {
     let scratch = ScratchDir::create("basic");
@@ -267,6 +289,60 @@ fn headless_mode_tracks_a_command_given_directly_on_argv() {
     );
     assert!(log.contains("reason: process exited"), "log: {log:?}");
     assert!(log.contains("exit code: 0"), "log: {log:?}");
+}
+
+#[test]
+fn view_flag_renders_a_logs_escape_sequences_as_visible_text() {
+    // RT-core-2026-07-30-06: a tracked program's raw output can contain
+    // terminal escape sequences that `cat`/`less -R` would execute in the
+    // viewer's own terminal. `--view` is the safe-by-default way to look
+    // at a log instead (see src/safe_view.rs); this drives it end-to-end
+    // against a log a real headless session actually produced, rather
+    // than unit-testing the transform in isolation.
+    let scratch = ScratchDir::create("view");
+
+    let track = Command::new(env!("CARGO_BIN_EXE_rustlogger"))
+        .arg("printf")
+        .arg("\x1b]0;PWNED-TITLE\x07clean output\rPWNED")
+        .current_dir(&scratch.path)
+        .output()
+        .expect("failed to run rustlogger in headless mode");
+    assert!(
+        track.status.success(),
+        "tracking run failed: {:?}, stderr: {}",
+        track.status,
+        String::from_utf8_lossy(&track.stderr)
+    );
+
+    let log_path = find_the_log_file(&scratch.path);
+    let raw_log = fs::read(&log_path).expect("failed to read log file");
+    assert!(
+        raw_log.contains(&0x1b),
+        "test setup didn't actually produce a raw ESC byte in the log: {raw_log:?}"
+    );
+
+    let view = Command::new(env!("CARGO_BIN_EXE_rustlogger"))
+        .arg("--view")
+        .arg(&log_path)
+        .output()
+        .expect("failed to run rustlogger --view");
+    assert!(
+        view.status.success(),
+        "rustlogger --view exited with {:?}, stderr: {}",
+        view.status,
+        String::from_utf8_lossy(&view.stderr)
+    );
+
+    assert!(
+        !view.stdout.contains(&0x1b),
+        "--view output still contains a raw ESC byte: {:?}",
+        String::from_utf8_lossy(&view.stdout)
+    );
+    let rendered = String::from_utf8_lossy(&view.stdout);
+    assert!(
+        rendered.contains("^[]0;PWNED-TITLE^Gclean output^MPWNED"),
+        "expected the escape sequence rendered as visible text, got: {rendered:?}"
+    );
 }
 
 #[test]

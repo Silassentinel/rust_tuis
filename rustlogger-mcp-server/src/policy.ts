@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
- * Opt-in restrictions on what this server may execute and where.
+ * Restrictions on what this server may execute and where.
  *
  * Running an arbitrary program *is* this server's job, so there is no fix
  * for `.security/findings.md` RT-mcp-2026-08-04-01 that doesn't change what
@@ -12,19 +12,33 @@ import path from "node:path";
  * execution - detached, and outliving both the injection turn and this
  * server (see `sessionManager.ts` on why tracked processes are detached).
  *
- * The chosen shape (chunk 9 decision in `.security/mitigation-plan.md`) is
- * an **opt-in allowlist**: with nothing configured, behavior is exactly
- * what it has always been, so no existing setup breaks; whoever runs the
- * server can then narrow it without touching code. Configuration lives in
- * environment variables rather than tool inputs on purpose - the client
- * (and therefore anything that injected the client) must not be able to
- * widen its own permissions.
+ * The command allowlist is **required by default** (revised from the
+ * original opt-in chunk 9 decision, see `.security/mitigation-plan.md`):
+ * with nothing configured, `assertCommandAllowed` refuses everything,
+ * because a silent fail-open default is exactly the exposure the finding
+ * was about. An operator who wants the old unrestricted behavior back
+ * (e.g. a single-user local setup where "the agent" is just the operator
+ * themselves) sets `RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS` explicitly - that
+ * choice is then visible in the server's own config rather than being
+ * true by omission. Configuration lives in environment variables rather
+ * than tool inputs on purpose - the client (and therefore anything that
+ * injected the client) must not be able to widen its own permissions.
+ *
+ * The cwd-roots restriction (RT-mcp-2026-08-04-05, low severity, only a
+ * contributing factor to RT-core-2026-07-30-02's symlink attack) is
+ * unchanged and stays opt-in: unset means any directory is allowed.
  *
  *   RUSTLOGGER_MCP_ALLOWED_COMMANDS
  *     Comma-separated. Each entry matches either a bare command name
  *     ("npm") or an absolute path ("/usr/bin/python3"). A request whose
  *     `command` is neither an exact match nor a path whose basename
- *     matches is refused. Unset/empty = allow anything.
+ *     matches is refused. Unset/empty = fall through to the check below.
+ *
+ *   RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS
+ *     Explicit opt-out of the allowlist requirement. Only consulted when
+ *     RUSTLOGGER_MCP_ALLOWED_COMMANDS is unset/empty. Truthy values ("1",
+ *     "true", "yes", case-insensitive) restore the original
+ *     run-anything behavior; anything else (including unset) does not.
  *
  *   RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS
  *     Comma-separated absolute directories. A request's `cwd` must resolve
@@ -34,6 +48,7 @@ import path from "node:path";
  */
 
 const COMMANDS_ENV = "RUSTLOGGER_MCP_ALLOWED_COMMANDS";
+const ALLOW_ALL_COMMANDS_ENV = "RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS";
 const CWD_ROOTS_ENV = "RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS";
 
 function parseList(value: string | undefined): string[] {
@@ -46,10 +61,21 @@ function parseList(value: string | undefined): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+function parseBoolEnv(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  return ["1", "true", "yes"].includes(value.trim().toLowerCase());
+}
+
 /** Read fresh on each call rather than cached at import, so a test (or an
  * operator restarting under a new environment) sees the current value. */
 export function allowedCommands(): string[] {
   return parseList(process.env[COMMANDS_ENV]);
+}
+
+export function allCommandsExplicitlyAllowed(): boolean {
+  return parseBoolEnv(process.env[ALLOW_ALL_COMMANDS_ENV]);
 }
 
 export function allowedCwdRoots(): string[] {
@@ -57,17 +83,30 @@ export function allowedCwdRoots(): string[] {
 }
 
 /**
- * Throws unless `command` is permitted by the configured allowlist. A
- * bare name in the allowlist ("npm") also authorizes an absolute path
- * whose basename matches ("/usr/bin/npm"), since those are the same
- * program from the operator's point of view; the reverse is not true - an
- * allowlist entry that is an absolute path authorizes only that exact
- * path.
+ * Throws unless `command` is permitted. With `RUSTLOGGER_MCP_ALLOWED_COMMANDS`
+ * configured, only entries on that list pass - a bare name ("npm") also
+ * authorizes an absolute path whose basename matches ("/usr/bin/npm"),
+ * since those are the same program from the operator's point of view; the
+ * reverse is not true, an allowlist entry that is an absolute path
+ * authorizes only that exact path. With nothing configured, every command
+ * is refused unless `RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS` explicitly opts out
+ * of the allowlist requirement.
  */
 export function assertCommandAllowed(command: string): void {
   const allowed = allowedCommands();
+
   if (allowed.length === 0) {
-    return;
+    if (allCommandsExplicitlyAllowed()) {
+      return;
+    }
+    throw new Error(
+      `no command allowlist is configured, so this server refuses to run ` +
+        `anything by default. Set ${COMMANDS_ENV} to a comma-separated list ` +
+        `of permitted commands (e.g. "npm,cargo,make"), or set ` +
+        `${ALLOW_ALL_COMMANDS_ENV}=1 to explicitly run without an ` +
+        `allowlist - only do that if nothing driving this server can ever ` +
+        `relay untrusted content.`,
+    );
   }
 
   const permitted = allowed.some((entry) => {

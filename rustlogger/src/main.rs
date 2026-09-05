@@ -17,6 +17,11 @@ use std::path::PathBuf;
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
 
+    if args.peek().map(String::as_str) == Some("--view") {
+        args.next();
+        std::process::exit(run_view(args.next()));
+    }
+
     let log_dir = resolve_log_dir(&mut args);
 
     let result: io::Result<i32> = match args.next() {
@@ -35,6 +40,35 @@ fn main() {
         Err(e) => {
             eprintln!("rustlogger: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Implements `rustlogger --view <path>`: prints a log with control and
+/// escape bytes rendered as visible text (see `safe_view`) instead of
+/// left raw for the terminal to act on. Returns the process exit code
+/// rather than an `io::Result` because it's called from a spot in `main`
+/// that has already committed to `std::process::exit` either way (see
+/// the caller) - this is `--view`'s own path only, never `main`'s normal
+/// `Ok(code)`/`Err(e)` result handling, so it reports its own errors and
+/// picks its own exit codes directly rather than reusing that match arm.
+fn run_view(path: Option<String>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("rustlogger --view: expected a log file path");
+        return 2;
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rustlogger --view: {path}: {e}");
+            return 1;
+        }
+    };
+    match rustlogger::safe_view::write_visible(file, std::io::stdout().lock()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("rustlogger --view: {path}: {e}");
+            1
         }
     }
 }

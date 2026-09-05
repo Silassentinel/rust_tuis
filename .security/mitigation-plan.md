@@ -24,6 +24,30 @@ contain — a matching leak of the pty *slave* fd, and the fact that setting
 this crate's own parallel test run). Both are fixed; see `findings.md`'s status
 section.
 
+**2026-09-05 follow-up** (independent verification, then two more decisions):
+
+- An independent red-team pass (`.security/verification-2026-09-report.md`)
+  re-ran every original exploit against the fixed code rather than trusting
+  the self-assigned statuses above, and found chunk 9's opt-in allowlist left
+  RT-mcp-2026-08-04-01's high-severity RCE fully open under default
+  configuration — the fix existed but nothing required using it.
+- Chunk 9 revised: the command allowlist is now required by default
+  (`RUSTLOGGER_MCP_ALLOWED_COMMANDS` or explicit
+  `RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS` opt-out), rather than opt-in. This
+  repo's own `.mcp.json` sets the explicit opt-out so this session's existing
+  use of the server keeps working.
+- Chunk 4 gained the piece its own text had flagged as still missing: a
+  `rustlogger --view <path>` command (`src/safe_view.rs`) that renders
+  control/escape bytes as visible text, so the safe-viewing side of "sanitize
+  at the consumer boundary" no longer depends on a human remembering
+  `cat -v` over `cat`. The byte-exact on-disk format is unchanged.
+- Chunks 6, 7, and 12 (the remaining `low`-severity items) were reassessed
+  against this project's actual threat model — private, never publicly
+  exposed — rather than left at their 2026-08-04 status by default. None of
+  the three changed as a result; see each finding's RESOLUTION in
+  `findings.md` for why exposure wasn't the load-bearing factor in any of
+  them. If that threat model ever changes, revisit those three specifically.
+
 The original plan text follows unchanged, for the record.
 
 ---

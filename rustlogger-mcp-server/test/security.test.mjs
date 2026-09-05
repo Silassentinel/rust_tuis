@@ -12,7 +12,11 @@ import test from "node:test";
 
 import { sanitizeLogForModel, frameAsUntrusted } from "../dist/sanitize.js";
 import { tailFile } from "../dist/tailFile.js";
-import { assertCommandAllowed, assertCwdAllowed } from "../dist/policy.js";
+import {
+  assertCommandAllowed,
+  assertCwdAllowed,
+  allCommandsExplicitlyAllowed,
+} from "../dist/policy.js";
 import { readProcessStartTime, isSameProcess } from "../dist/processIdentity.js";
 import { withStateLock } from "../dist/sessionStore.js";
 
@@ -162,7 +166,8 @@ test("tailFile on a missing file yields empty rather than throwing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Chunks 9+12 (RT-mcp-2026-08-04-01/05): opt-in command + cwd allowlists
+// Chunks 9+12 (RT-mcp-2026-08-04-01/05): command allowlist (required by
+// default, explicit opt-out) + cwd allowlist (opt-in, unchanged)
 // ---------------------------------------------------------------------------
 
 test("command/cwd policy scenarios", (t) => {
@@ -170,21 +175,44 @@ test("command/cwd policy scenarios", (t) => {
   // process-wide environment variables, so separate parallel test cases
   // would race each other.
   const savedCommands = process.env.RUSTLOGGER_MCP_ALLOWED_COMMANDS;
+  const savedAllowAll = process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS;
   const savedRoots = process.env.RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS;
   delete process.env.RUSTLOGGER_MCP_ALLOWED_COMMANDS;
+  delete process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS;
   delete process.env.RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS;
 
   t.after(() => {
     if (savedCommands === undefined) delete process.env.RUSTLOGGER_MCP_ALLOWED_COMMANDS;
     else process.env.RUSTLOGGER_MCP_ALLOWED_COMMANDS = savedCommands;
+    if (savedAllowAll === undefined) delete process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS;
+    else process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS = savedAllowAll;
     if (savedRoots === undefined) delete process.env.RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS;
     else process.env.RUSTLOGGER_MCP_ALLOWED_CWD_ROOTS = savedRoots;
   });
 
-  // Unset = today's behavior, nothing refused. Backward compatibility is
-  // the whole point of making this opt-in.
+  // Nothing configured at all: fail closed. This is the behavior change
+  // from the original opt-in design - a silent fail-open default was
+  // exactly RT-mcp-2026-08-04-01's exposure.
+  assert.throws(() => assertCommandAllowed("bash"), /refuses to run anything by default/);
+  assert.equal(allCommandsExplicitlyAllowed(), false);
+
+  // Explicit opt-out restores the original unrestricted behavior.
+  process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS = "1";
+  assert.equal(allCommandsExplicitlyAllowed(), true);
   assert.doesNotThrow(() => assertCommandAllowed("bash"));
   assert.doesNotThrow(() => assertCommandAllowed("/usr/bin/anything"));
+
+  // Falsy-looking values do not count as opting out.
+  for (const value of ["0", "false", "no", ""]) {
+    process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS = value;
+    assert.equal(allCommandsExplicitlyAllowed(), false, `expected "${value}" to not opt out`);
+    assert.throws(() => assertCommandAllowed("bash"), /refuses to run anything by default/);
+  }
+  delete process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS;
+
+  // An explicit allowlist takes priority over (and doesn't need) the
+  // opt-out flag.
+  process.env.RUSTLOGGER_MCP_ALLOW_ALL_COMMANDS = "1";
 
   // Configured: exact name allowed, anything else refused.
   process.env.RUSTLOGGER_MCP_ALLOWED_COMMANDS = "npm, cargo";
