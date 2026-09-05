@@ -45,6 +45,17 @@ pub struct DueInfo {
     pub due_days: Option<f64>,
 }
 
+/// "daily" / "every 3 days" style label for an interval-1-or-more cadence
+/// with no day component. `singular` is used verbatim for `interval == 1`;
+/// otherwise `"every {interval} {plural}"`.
+fn freq_label(interval: u32, singular: &str, plural: &str) -> String {
+    if interval == 1 {
+        singular.to_string()
+    } else {
+        format!("every {interval} {plural}")
+    }
+}
+
 fn join_non_empty(parts: &[Option<String>], sep: &str) -> String {
     parts
         .iter()
@@ -70,19 +81,11 @@ pub fn format_cadence(schedule: &Schedule) -> String {
             join_non_empty(&[Some(freq), Some(inner)], " \u{b7} ")
         }
         Cadence::Daily => {
-            let freq = if schedule.interval == 1 {
-                "daily".to_string()
-            } else {
-                format!("every {} days", schedule.interval)
-            };
+            let freq = freq_label(schedule.interval, "daily", "days");
             join_non_empty(&[Some(freq), schedule.time.clone()], " \u{b7} ")
         }
         Cadence::Monthly => {
-            let freq = if schedule.interval == 1 {
-                "monthly".to_string()
-            } else {
-                format!("every {} months", schedule.interval)
-            };
+            let freq = freq_label(schedule.interval, "monthly", "months");
             join_non_empty(&[Some(freq), schedule.time.clone()], " \u{b7} ")
         }
     }

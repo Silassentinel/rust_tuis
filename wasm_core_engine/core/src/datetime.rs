@@ -46,7 +46,7 @@ impl DateTime {
     /// "monthly" is expected to mean; documented here explicitly since
     /// it's a real behavior decision, not just an implementation detail.
     pub fn add_months(&self, months: i64) -> Self {
-        let total = i64::from(self.year) * 12 + i64::from(self.month - 1) + months;
+        let total = i64::from(self.year) * 12 + (i64::from(self.month) - 1) + months;
         let year = total.div_euclid(12) as i32;
         let month = (total.rem_euclid(12) + 1) as u32;
         let day = self.day.min(days_in_month(year, month));
@@ -64,19 +64,20 @@ impl DateTime {
         (self_minutes - other_minutes) as f64 / (24.0 * 60.0)
     }
 
-    pub fn weekday_short(&self) -> &'static str {
-        const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    fn weekday_index(&self) -> usize {
         let days = days_from_civil(self.year, self.month, self.day);
         // 1970-01-01 (day 0) was a Thursday (index 4).
-        let idx = (((days % 7) + 7 + 4) % 7) as usize;
-        NAMES[idx]
+        (((days % 7) + 7 + 4) % 7) as usize
+    }
+
+    pub fn weekday_short(&self) -> &'static str {
+        const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        NAMES[self.weekday_index()]
     }
 
     pub fn weekday_long(&self) -> &'static str {
         const NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-        let days = days_from_civil(self.year, self.month, self.day);
-        let idx = (((days % 7) + 7 + 4) % 7) as usize;
-        NAMES[idx]
+        NAMES[self.weekday_index()]
     }
 
     pub fn month_long(&self) -> &'static str {
