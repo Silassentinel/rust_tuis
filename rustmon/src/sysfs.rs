@@ -471,6 +471,24 @@ fn is_control_char(c: char) -> bool {
     code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code)
 }
 
+/// Unicode bidi-override/isolate controls and the line/paragraph separators
+/// — none of these are C0/C1 control bytes, so `is_control_char` above
+/// doesn't catch them, but they're the same class of problem: a kernel
+/// string (a mount source, a USB device name) that changes how surrounding
+/// text *displays* without changing what it *is*. RTL/LRI overrides can
+/// reorder what a reviewer reads on screen (the "Trojan Source" family of
+/// attacks); U+2028/U+2029 can split a line the same way `\n`/`\r` would in
+/// a renderer that treats them as line breaks. Security model item 7,
+/// closing RM-2026-08-04-04.
+fn is_bidi_or_line_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{202a}'..='\u{202e}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+        | '\u{2028}' // LINE SEPARATOR
+        | '\u{2029}' // PARAGRAPH SEPARATOR
+    )
+}
+
 /// Consume a CSI sequence's parameter bytes and its final byte.
 ///
 /// ECMA-48: parameters and intermediates are `0x20..=0x3f`, the final byte is
@@ -546,6 +564,7 @@ pub fn sanitize_kernel_string(s: &str, max_len: usize) -> String {
             '\u{9b}' => consume_csi(&mut chars),
             '\u{9d}' => consume_osc(&mut chars),
             c if is_control_char(c) => {}
+            c if is_bidi_or_line_format_char(c) => {}
             c => {
                 out.push(c);
                 kept += 1;
@@ -753,6 +772,27 @@ pub(crate) mod tests {
         // Unterminated: swallowing the remainder beats emitting a fragment
         // that leaves a real terminal waiting for a terminator.
         assert_eq!(sanitize_kernel_string("keep\u{1b}]0;forever", 64), "keep");
+    }
+
+    /// RM-2026-08-04-04: a kernel string carrying a Unicode bidi
+    /// override/isolate, or a U+2028/U+2029 line/paragraph separator, must
+    /// not survive sanitisation — none of these are C0/C1 control bytes, so
+    /// they'd otherwise sail straight through the control-character check
+    /// above and let a device name change how it *displays* (a
+    /// Trojan-Source-style spoof) without changing what it *is*.
+    #[test]
+    fn sanitize_strips_bidi_overrides_and_line_format_chars() {
+        // RLO ... PDF: without stripping, this would visually reorder as
+        // "cod)!(SUS" — the same trick as an RTL-override filename spoof.
+        assert_eq!(
+            sanitize_kernel_string("USB(\u{202e}cod!)\u{202c}", 64),
+            "USB(cod!)"
+        );
+        // The other three override/isolate ranges, one representative each.
+        assert_eq!(sanitize_kernel_string("a\u{202a}b\u{2066}c\u{2069}d", 64), "abcd");
+        // Line/paragraph separators: not `\n`/`\r`, but a renderer that
+        // treats them as line breaks would still be split by them.
+        assert_eq!(sanitize_kernel_string("a\u{2028}b\u{2029}c", 64), "abc");
     }
 
     #[test]

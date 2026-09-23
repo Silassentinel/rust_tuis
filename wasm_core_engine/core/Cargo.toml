@@ -13,5 +13,5 @@ crate-type = ["cdylib", "rlib"]
 # INTENTIONALLY EMPTY — see ../docs/crate-checklist.md and CLAUDE.md standing
 # rule 1. wasm-bindgen (or a comparable binding layer) is the obvious first
 # addition once real porting starts; it still needs an entry there and
-# explicit sign-off before `cargo add`, same as every other project under
-# /home/silassentinel/code/Rust.
+# explicit sign-off before `cargo add`, same as every other project in this
+# workspace.

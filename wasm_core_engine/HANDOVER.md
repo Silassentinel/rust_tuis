@@ -1,8 +1,8 @@
 # Handover — shared Rust/WASM core engine
 
-_Written 2026-08-05, by a Claude Code session working in
-`/home/silassentinel/code/website/features/ferment-tracker-app/`. That
-project's own docs (`data/PLAN.md`, `data/SCHEMA.md`) called this "Phase 4."
+_Written 2026-08-05, by a Claude Code session working in a sibling project,
+`ferment-tracker-app/`. That project's own docs (`data/PLAN.md`,
+`data/SCHEMA.md`) called this "Phase 4."
 Read this whole file before writing code — it has the decision this crate
 still needs to make before porting starts._
 
@@ -37,9 +37,8 @@ own project, not nested in `website/`. Two things follow from that:
 
 ## What to port (the concrete reference)
 
-The logic to extract lives in one file:
-`/home/silassentinel/code/website/features/ferment-tracker-app/server/fermentData.ts`.
-Its exported functions, as of this handover:
+The logic to extract lives in one file, in `ferment-tracker-app`:
+`server/fermentData.ts`. Its exported functions, as of this handover:
 
 **Pure — no filesystem, straightforward first targets:**
 - `parseFieldLabel(raw: string): ChecklistField` — infers an input kind

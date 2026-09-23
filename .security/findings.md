@@ -36,14 +36,33 @@ from a scanner rather than manual/red-team review.
 
 Every `RT-*` finding (rustlogger core and its MCP server) is now `closed`,
 `mitigated` or `accepted`; each row carries a **RESOLUTION** note saying
-which and why.
+which and why. As of the 2026-09-23 update below, the same is now true of
+every `RM-*` finding (rustmon).
+
+**2026-09-23 update — the six `RM-*` findings re-checked against real code.**
+They were filed 2026-08-04 against `rustmon`'s doc-comment specs while the
+crate was still 171 `todo!()` bodies with zero executable logic (see the
+Details section below) — "open" meant "the spec doesn't require the right
+thing yet," not "exploitable today." `rustmon` has since been implemented
+(396+ tests green, `cargo clippy --all-features` clean). Re-checked each
+finding against the actual shipped code, not just the status this table
+carried forward on autopilot: five turned out to already be fixed as part
+of normal implementation (the spec's own follow-through), just never
+reflected back here. The sixth, RM-2026-08-04-04, was not — `rustmon` was
+about to go public with a real, dated, file-and-line map of a live
+Unicode-bidi-spoofing gap sitting unpatched in its own security log, which
+is a materially worse position than either fixing it or not having filed
+the finding at all. Fixed now (`sysfs::is_bidi_or_line_format_char`, new
+regression test `sanitize_strips_bidi_overrides_and_line_format_chars`),
+verified with the same "does the original repro still work" standard as
+the RT-* closures. See each RM-* row's RESOLUTION.
 
 | Status | Count | Meaning |
 |---|---|---|
-| closed | 13 | Fixed in code, with a regression test that fails without the fix, and independently confirmed against the original exploit. |
+| closed | 19 | Fixed in code, with a regression test that fails without the fix, and independently confirmed against the original exploit. |
 | mitigated | 2 | Cannot be "fixed" without changing what the tool is for; a control now exists rather than a behavior change (RT-core-2026-07-30-06's `--view`; RT-mcp-2026-08-04-05's opt-in `cwd` confinement, reassessed 2026-09-05 as acceptable to leave opt-in given the private/local threat model). |
 | accepted | 1 | A deliberate, reassessed-and-reaffirmed design decision: `stoplogger` matching typed data (RT-core-2026-07-30-09). |
-| open | 7 | RT-core-…-10 (dependency hygiene, reassessed 2026-09-05 — still open, see that row) plus the six `RM-*` rustmon spec findings, which belong to a different sub-project and were not part of this plan. |
+| open | 1 | RT-core-…-10 (dependency hygiene, reassessed 2026-09-05 — still open, see that row). |
 
 Verification for the closed items is not just "tests pass": each original
 exploit repro from the details below was re-run against the rebuilt binary
@@ -77,14 +96,23 @@ Two things found *during* the fix work, neither in the original report:
 | RT-core-2026-07-30-08 | low | `rustlogger/src/stop_trigger.rs:33-55` | closed | 2026-07-30 | `StopTrigger::line` is an unbounded `Vec<u8>` cleared only on `\n`/`\r`/`0x03`. Input with none of those grows rustlogger's RSS 1:1 — 400 MiB sent, 412 MB RSS measured. See detail RT-core-2026-07-30-08. **RESOLUTION:** fixed 2026-08-04 (chunk 5): StopTrigger line capped at 512 bytes; over-long lines are dropped and cannot match. |
 | RT-core-2026-07-30-09 | low | `rustlogger/src/stop_trigger.rs:33-61` + `session/unix.rs:114-116` | accepted | 2026-07-30 | The stop phrase is matched against *all* outer input regardless of what is consuming it, so typing/pasting `stoplogger` as data into an editor, pager or `cat` kills the session and SIGHUPs the shell. Confirmed. See detail RT-core-2026-07-30-09. **RESOLUTION:** accepted 2026-08-04 (chunk 6): documented as a known limitation in stop_trigger.rs, HOWTO, man page and design doc. Reassessed 2026-09-05 against this project's actual threat model (private, never publicly exposed): this finding is about the tool's *own operator* accidentally ending their own session by typing/pasting a word — there is no attacker in that picture, only an inconvenience. Public exposure was never a factor in the original risk either way, so the reassessment changes nothing; still accepted, no code change. |
 | RT-core-2026-07-30-10 | low | `Cargo.lock:160-234` | open | 2026-07-30 | Supply chain: `portable-pty 0.9.0` (cfg(windows) path) pulls unmaintained `shared_library 0.1.9` (RUSTSEC-2020-0128), `winapi 0.3.9`, `winreg 0.10.1`, plus a second older `nix 0.28.0`. Snyk MCP scans could not run (auth/trust errors) — see detail RT-core-2026-07-30-10. **RESOLUTION:** deliberately out of scope for the 2026-08-04 mitigation pass (chunk 7): swapping or pinning portable-pty's transitive deps is a dependency decision requiring its own docs/crate-checklist.md entry and sign-off per CLAUDE.md. Left open on purpose; re-run snyk sca/code once the folder is trusted and the CLI authenticated. Reassessed 2026-09-05: unmaintained-dependency/RUSTSEC exposure is a supply-chain and maintenance-burden concern, not a "will a public attacker reach this" one — whether the project is ever exposed publicly doesn't change the calculus, and the finding only affects the Windows build path this project has never actually built or run. Still correctly left open, gated on the crate-checklist process. |
-| RM-2026-08-04-01 | high (spec-level, N/A today) | `rustmon/src/collectors/disk.rs:95,100` + `sample.rs:232-235` | open | 2026-08-04 | Pre-implementation (crate is all `todo!()`). Mount `source`/`mount_point`/`fs_type` strings have no `sanitize_kernel_string` requirement in spec, unlike other collectors → terminal escape injection once implemented. Confirmed via unprivileged user-namespace PoC that ESC bytes survive `/proc/self/mounts` unescaped. See detail RM-2026-08-04-01. |
-| RM-2026-08-04-02 | medium | `rustmon/src/sysfs.rs:77-85` + `docs/rustmon-design.md:141-142` | open | 2026-08-04 | `SysfsReader::resolve`'s documented symlink-escape defense (`canonical.starts_with(&root)`) is a no-op when `root` is `/`, the production default. See detail RM-2026-08-04-02. |
-| RM-2026-08-04-03 | medium-low | `rustmon/src/collectors/disk.rs:77` + `sample.rs:219` | open | 2026-08-04 | `/proc/diskstats` device names have no sanitization requirement in spec, asymmetric with `net.rs`'s `is_safe_component` allowlist for interface names. See detail RM-2026-08-04-03. |
-| RM-2026-08-04-04 | low | `rustmon/src/sysfs.rs:156-157` | open | 2026-08-04 | `sanitize_kernel_string` spec filters C0/C1 and ANSI CSI/OSC but not Unicode bidi-override/isolate format characters (U+202A-202E, U+2066-2069) or U+2028/U+2029 — Trojan-Source-style display spoofing risk. See detail RM-2026-08-04-04. |
-| RM-2026-08-04-05 | low | `rustmon/src/ui/mod.rs:48-50` | open | 2026-08-04 | `TerminalGuard::drop` is itself `todo!()`, contradicting its own "must not panic" comment — a panic during unwind through this guard aborts and leaves the terminal in raw/alt-screen mode. Latent until the guard is actually constructed. See detail RM-2026-08-04-05. |
-| RM-2026-08-04-06 | low | `rustmon/src/config.rs:23,76` | open | 2026-08-04 | `--history` bound is referenced as "security model item 8" in three places but no `MAX_HISTORY_LEN` constant exists anywhere — unbounded value self-inflicts OOM (each history entry is a full `Snapshot`). See detail RM-2026-08-04-06. |
+| RM-2026-08-04-01 | high (spec-level, N/A today) | `rustmon/src/collectors/disk.rs:95,100` + `sample.rs:232-235` | closed | 2026-08-04 | Pre-implementation (crate is all `todo!()`). Mount `source`/`mount_point`/`fs_type` strings have no `sanitize_kernel_string` requirement in spec, unlike other collectors → terminal escape injection once implemented. Confirmed via unprivileged user-namespace PoC that ESC bytes survive `/proc/self/mounts` unescaped. See detail RM-2026-08-04-01. **RESOLUTION:** found already fixed on 2026-09-23 re-check — `disk.rs`'s `parse_diskstats_line`/mount parsing runs `source`, `mount_point`, and `fs_type` through `sanitize_kernel_string` (see lines ~292-294), and a regression test (`a_hostile_mount_source_is_sanitised`) asserts no raw ESC byte survives. Implemented as part of the crate's normal build-out, this finding's spec requirement having been carried through; the status here was just never updated to say so. |
+| RM-2026-08-04-02 | medium | `rustmon/src/sysfs.rs:77-85` + `docs/rustmon-design.md:141-142` | closed | 2026-08-04 | `SysfsReader::resolve`'s documented symlink-escape defense (`canonical.starts_with(&root)`) is a no-op when `root` is `/`, the production default. See detail RM-2026-08-04-02. **RESOLUTION:** found already addressed on 2026-09-23 re-check, via the doc-first option this finding suggested rather than the code-first one: `sysfs.rs`'s module doc comment now states the vacuous-at-`/` caveat explicitly and names the component allowlist (`is_safe_component` + rejection of `..`/absolute paths) as what actually protects the production path — the same reasoning this finding's own resolution direction offered. Not a silent gap; a documented, deliberate tradeoff. |
+| RM-2026-08-04-03 | medium-low | `rustmon/src/collectors/disk.rs:77` + `sample.rs:219` | closed | 2026-08-04 | `/proc/diskstats` device names have no sanitization requirement in spec, asymmetric with `net.rs`'s `is_safe_component` allowlist for interface names. See detail RM-2026-08-04-03. **RESOLUTION:** found already fixed on 2026-09-23 re-check — `parse_diskstats_line` rejects any device name that fails `is_safe_component`, closing the asymmetry with `net.rs` this finding flagged. |
+| RM-2026-08-04-04 | low | `rustmon/src/sysfs.rs:156-157` | closed | 2026-08-04 | `sanitize_kernel_string` spec filters C0/C1 and ANSI CSI/OSC but not Unicode bidi-override/isolate format characters (U+202A-202E, U+2066-2069) or U+2028/U+2029 — Trojan-Source-style display spoofing risk. See detail RM-2026-08-04-04. **RESOLUTION:** the one RM finding still genuinely open at the 2026-09-23 re-check — `is_control_char` only ever covered C0/C1 ranges, never the bidi/format characters this finding named. Fixed 2026-09-23: new `is_bidi_or_line_format_char` predicate strips U+202A-202E, U+2066-2069, U+2028 and U+2029 inside `sanitize_kernel_string`, with regression test `sanitize_strips_bidi_overrides_and_line_format_chars` (asserts a crafted RLO/PDF device name like `USB(\u{202e}cod!)\u{202c}` sanitizes to `USB(cod!)`, not a visually-reordered string). |
+| RM-2026-08-04-05 | low | `rustmon/src/ui/mod.rs:48-50` | closed | 2026-08-04 | `TerminalGuard::drop` is itself `todo!()`, contradicting its own "must not panic" comment — a panic during unwind through this guard aborts and leaves the terminal in raw/alt-screen mode. Latent until the guard is actually constructed. See detail RM-2026-08-04-05. **RESOLUTION:** found already fixed on 2026-09-23 re-check — `TerminalGuard::drop` now calls `ratatui::restore()`, which (per its own doc) prints any failure to stderr and swallows it rather than propagating, satisfying the "must not panic" contract this finding's spec review flagged as unmet. |
+| RM-2026-08-04-06 | low | `rustmon/src/config.rs:23,76` | closed | 2026-08-04 | `--history` bound is referenced as "security model item 8" in three places but no `MAX_HISTORY_LEN` constant exists anywhere — unbounded value self-inflicts OOM (each history entry is a full `Snapshot`). See detail RM-2026-08-04-06. **RESOLUTION:** found already fixed on 2026-09-23 re-check — `config.rs` defines `MAX_HISTORY_LEN = 3600` and `Config::validate` clamps `history_len` to it, with a regression test (`validate_caps_an_unbounded_history_length`) asserting `usize::MAX` gets clamped down. |
 
 ## Details (RM, 2026-08-04 pass — rustmon, pre-implementation spec review)
+
+**Historical section — read the 2026-09-23 update near the top of this file
+first.** Everything below describes `rustmon` as it stood on 2026-08-04: 171
+`todo!()` bodies across 27 files, zero executable logic. `rustmon` has since
+been implemented in full; each finding's RESOLUTION in the table above says
+what happened to it against the real code, not the spec described here.
+Left as-written rather than rewritten, since the repro commands and
+reasoning below are still the original evidence each RESOLUTION points back
+to.
 
 `rustmon/` is untracked and entirely new: 171 `todo!()` bodies across 27 files, zero executable logic beyond a few `const fn` getters and `Ok(None)` stubs, no `rustmon/tests/` directory. `cargo run -q -p rustmon` panics immediately on the first `todo!()` (`rustmon::cli::parse`, exit 101). Verified negatives that hold today: no `std::process::Command`, no `env::var`, no `OpenOptions`/write path, no `/tmp` usage, no network, and `[dependencies]` is empty (no third-party supply chain). `snyk code test rustmon/` → 0 issues (expected, no code); `snyk test --file=rustmon/Cargo.toml` → could not detect a package manager (Snyk CLI has no Cargo parser here) — moot with zero dependencies. No IaC/container manifests in scope.
 
@@ -140,7 +168,7 @@ impl Drop for TerminalGuard {
 
 ## Details (RT-core, 2026-07-30 pass — rustlogger Rust core)
 
-Scanner status for this run: `snyk_sca_scan` returned `folder '/home/silassentinel/code/Rust/rust_tuis' is not trusted. Please run 'snyk_trust' first`; `snyk_code_scan` returned `User not authenticated. Please run 'snyk_auth' first`. No `snyk_trust`/`snyk_auth` tool is exposed in this session, so **no Snyk SAST or SCA result exists for this pass** — everything below is manual review plus working exploits. `snyk_package_health_check` supports npm/golang/pypi/maven/nuget only, so it does not apply to a Cargo project.
+Scanner status for this run: `snyk_sca_scan` returned `folder '$(repo checkout path)' is not trusted. Please run 'snyk_trust' first`; `snyk_code_scan` returned `User not authenticated. Please run 'snyk_auth' first`. No `snyk_trust`/`snyk_auth` tool is exposed in this session, so **no Snyk SAST or SCA result exists for this pass** — everything below is manual review plus working exploits. `snyk_package_health_check` supports npm/golang/pypi/maven/nuget only, so it does not apply to a Cargo project.
 
 ### RT-core-2026-07-30-01 — session log is world-readable
 
@@ -180,10 +208,10 @@ $ rustlogger                                    # under a real terminal
 $ ls -l /proc/self/fd                           # 3 -> /dev/ptmx   (the MASTER)
 $ (sleep 0.5; printf 'id -un > /tmp/rustlogger-PWNED\n' >&3) &
 $ exit
-$ cat /tmp/rustlogger-PWNED                     # silassentinel — the injected command ran
+$ cat /tmp/rustlogger-PWNED                     # $(whoami) — the injected command ran
 ```
 
-Scripted repro (drives rustlogger under a pty, no human needed): `scratchpad/inject.py` from this session, which prints `injected command executed? True silassentinel`. Impact: escape from any lower-privileged context launched inside a logged session back into the session user's shell. Headless mode is affected identically — the *tracked* untrusted command holds the same fd.
+Scripted repro (drives rustlogger under a pty, no human needed): `scratchpad/inject.py` from this session, which prints `injected command executed? True $(whoami)`. Impact: escape from any lower-privileged context launched inside a logged session back into the session user's shell. Headless mode is affected identically — the *tracked* untrusted command holds the same fd.
 
 ### RT-core-2026-07-30-04 — same leaked master fd defeats the log (audit bypass)
 
