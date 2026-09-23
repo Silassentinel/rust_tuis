@@ -151,11 +151,11 @@ fn build_echo_request(ident: u16, seq: u16) -> Vec<u8> {
 /// carries back in, complement.
 fn icmp_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u32::from(u16::from_be_bytes(*chunk));
     }
-    if let [last] = *chunks.remainder() {
+    if let [last] = *remainder {
         sum += u32::from(u16::from_be_bytes([last, 0]));
     }
     while sum >> 16 != 0 {

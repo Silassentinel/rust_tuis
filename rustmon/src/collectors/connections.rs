@@ -228,9 +228,9 @@ fn parse_hex_addr(hex: &str) -> Option<IpAddr> {
         }
         16 => {
             let mut out = [0u8; 16];
-            for (chunk_idx, chunk) in bytes.chunks_exact(4).enumerate() {
-                let mut word = [0u8; 4];
-                word.copy_from_slice(chunk);
+            let (chunks, _remainder) = bytes.as_chunks::<4>();
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                let mut word = *chunk;
                 word.reverse();
                 out[chunk_idx * 4..chunk_idx * 4 + 4].copy_from_slice(&word);
             }
