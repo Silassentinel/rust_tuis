@@ -10,13 +10,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  workspace:
+    name: Build & test (workspace, ubuntu-latest)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v5
+      - name: Build
+        run: cargo build --workspace --verbose
+      - name: Run tests
+        run: cargo test --workspace --verbose
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --verbose -- -D warnings
+
+  rustlogger-windows:
+    # rustlogger is the only workspace member with native Windows support
+    # (ConPTY via portable-pty, console handling via the `windows` crate —
+    # see rustlogger/Cargo.toml). rustmon is Linux-only by design (see
+    # docs/rustmon-design.md) and fails to cross-compile for Windows, so it
+    # is deliberately excluded here rather than run with `--workspace`.
+    name: Build & test (rustlogger, windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: cargo build -p rustlogger --verbose
+      - name: Run tests
+        run: cargo test -p rustlogger --verbose
+
+  rustlogger-mcp-server:
+    name: rustlogger-mcp-server (npm)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustlogger-mcp-server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: rustlogger-mcp-server/package-lock.json
+      - run: npm ci
+      - run: npm test

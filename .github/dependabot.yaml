@@ -6,3 +6,18 @@ updates:
       interval: "weekly"
     ignore:
       - dependency-name: "rustlogger-mcp-server"
+
+  # Root Cargo workspace: rustlogger, rustmon, wasm_core_engine/core all
+  # share the top-level Cargo.toml/Cargo.lock (see /Cargo.toml [workspace]).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Keeps the Actions pinned in .github/workflows/*.yml (actions/checkout,
+  # github/codeql-action, etc.) from going stale/deprecated unnoticed - see
+  # the `rust.yml`/`codeql.yml` fixes this entry accompanies.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
