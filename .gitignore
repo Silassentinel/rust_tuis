@@ -27,4 +27,3 @@ INDEX.md
 rustlogger-*.log
 
 **/*/spec
-wasm_core_engine/core/Cargo.toml

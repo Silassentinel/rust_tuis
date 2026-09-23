@@ -1,0 +1,17 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared business-logic core, compiled to WASM for web frontends and to a native lib for Rust desktop shells. See ../HANDOVER.md."
+license = "MIT"
+
+[lib]
+name = "core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# INTENTIONALLY EMPTY — see ../docs/crate-checklist.md and CLAUDE.md standing
+# rule 1. wasm-bindgen (or a comparable binding layer) is the obvious first
+# addition once real porting starts; it still needs an entry there and
+# explicit sign-off before `cargo add`, same as every other project under
+# /home/silassentinel/code/Rust.
