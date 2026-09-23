@@ -84,7 +84,7 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       suite passes there, plus the specific runtime risks called out in
       that doc (signal delivery under Android's process lifecycle
       management, in particular).
-- [x] 9. Cross-platform, part 2 - native Windows console. `pty_session.rs`,
+- [~] 9. Cross-platform, part 2 - native Windows console. `pty_session.rs`,
       `terminal.rs`, `signals.rs`, and `session.rs` were each split into a
       `mod.rs` (shared logic + `cfg`-gated dispatch, plus the
       platform-agnostic `StopSignal`/`StopReason` types) with `unix.rs`
@@ -123,3 +123,27 @@ passing and docs updated (see `docs/rustlogger-design.md`).
           another thread without a Win32 API surface beyond what's
           currently approved) - harmless at process exit, but worth
           confirming there's no observable side effect on real Windows.
+
+      **2026-09-23 update - now unchecked, a real Windows runner exists and
+      it hangs.** `.github/workflows/rust.yml` gained a `windows-latest`
+      job. `cargo build -p rustlogger` on it is clean, but
+      `cargo test -p rustlogger` (which includes
+      `tests/session_end_to_end.rs` - not `cfg(unix)`-gated, it spawns a
+      real ConPTY session on Windows the same way the Unix test spawns a
+      real pty) never completed: cancelled after 16+ minutes with no
+      output, on a job that should take a few minutes at most. This is a
+      genuine hang, not a slow cold build - the CI job now builds
+      `-p rustlogger` only (not `--verbose` test) until this is diagnosed;
+      see the comment in `rust.yml`.
+
+      No Windows machine is available in this dev environment to attach a
+      debugger or even get a stack trace, so this needs someone with real
+      Windows access next. Best first guesses, in order, given the "not
+      yet confirmed" list right above this note: the abandoned (unjoined)
+      worker thread in `session/windows.rs` somehow blocking process exit
+      even though it's "harmless" in theory, or the ConPTY EOF assumption
+      in `pty_session/windows.rs` never actually producing `Ok(0)`, so the
+      outer test's reader thread blocks forever waiting for output that
+      will never come. Re-enable `cargo test -p rustlogger` in the
+      Windows CI job and re-check this box only once it's actually been
+      seen to pass there.
