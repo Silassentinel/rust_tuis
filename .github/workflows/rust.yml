@@ -14,7 +14,7 @@ jobs:
     name: Build & test (workspace, ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build
         run: cargo build --workspace --verbose
       - name: Run tests
@@ -40,7 +40,7 @@ jobs:
     name: Build (rustlogger, windows-latest)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build
         run: cargo build -p rustlogger --verbose
 
@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: rustlogger-mcp-server
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
