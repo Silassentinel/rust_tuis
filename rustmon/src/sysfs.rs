@@ -1060,7 +1060,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn list_dir_filters_unsafe_names_sorts_and_caps() {
+    fn list_dir_filters_unsafe_names_and_sorts() {
         let tree = TempTree::new("list");
         tree.dir("sys/class/net/eth0");
         tree.dir("sys/class/net/lo");
@@ -1078,11 +1078,37 @@ pub(crate) mod tests {
             value(r.list_dir(rel("sys/class/net"), &|n| n.starts_with('w'))),
             vec!["wlan0"]
         );
+    }
 
-        // The cap counts entries examined, so a hostile directory costs a
-        // bounded amount of work regardless of what `keep` says.
+    // The cap counts entries *examined*, not entries kept, so a hostile
+    // directory costs a bounded amount of work regardless of what `keep`
+    // (or the component allowlist) says about any given entry - see the
+    // comment above the `.take(self.max_entries)` call.
+    //
+    // This uses entries that all pass both the allowlist and `keep`, so
+    // the resulting count is exactly `max_entries` no matter what order
+    // `read_dir` happens to hand them back in. `read_dir` order is
+    // filesystem-dependent (see the sort comment in `list_dir` itself) -
+    // an earlier version of this test mixed in a name rejected by the
+    // allowlist within the same capped window and asserted an exact
+    // count, which only held for orderings where the rejected name
+    // wasn't examined first. It passed locally and flaked in CI once a
+    // workflow ran it on a filesystem that orders directory entries
+    // differently. The cap's actual guarantee is an upper bound on work
+    // done, not a promise of maximizing kept results within it, so the
+    // test asserts only what's actually guaranteed.
+    #[test]
+    fn list_dir_cap_counts_entries_examined() {
+        let tree = TempTree::new("list-cap");
+        for name in ["eth0", "eth1", "eth2", "eth3", "eth4"] {
+            tree.dir(&format!("sys/class/net/{name}"));
+        }
         let capped = tree.reader().with_max_entries(2);
-        assert_eq!(value(capped.list_dir(rel("sys/class/net"), &|_| true)).len(), 2);
+
+        assert_eq!(
+            value(capped.list_dir(rel("sys/class/net"), &|_| true)).len(),
+            2
+        );
     }
 
     // ---- construction ------------------------------------------------------
