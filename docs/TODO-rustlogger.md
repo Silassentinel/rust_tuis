@@ -147,3 +147,9 @@ passing and docs updated (see `docs/rustlogger-design.md`).
       will never come. Re-enable `cargo test -p rustlogger` in the
       Windows CI job and re-check this box only once it's actually been
       seen to pass there.
+- [ ] 10. Forward input, window size and resizes to the child pty (headless
+      and interactive modes). Requested 2026-10-24 by the virtualisation
+      repo's Chunk 123 (`scripts/track.sh tui` gets a 0 × 0 window, no
+      keys, and loses its exit code). Spec, tests and done criteria:
+      `docs/spec-rustlogger-headless-terminal-forwarding.md`. Not started;
+      one open user decision (I2: whether forwarded keys are logged).
