@@ -56,7 +56,7 @@ ratatui = { version = "0.30.2", default-features = false, optional = true }
 # `fs-capacity` feature above. POSIX-only, so cfg(unix)-gated like
 # rustlogger's own usage.
 [target."cfg(unix)".dependencies]
-nix = { version = "0.31", features = ["fs"], optional = true }
+nix = { version = "0.32", features = ["fs"], optional = true }
 
 [lib]
 name = "rustmon"

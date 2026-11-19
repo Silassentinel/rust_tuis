@@ -15,7 +15,7 @@ description = "Wraps the shell in the terminal it's launched from and logs the w
 # a POSIX bindings crate with no Windows support at all, so it's gated to
 # cfg(unix) here (chunk 9) rather than a plain [dependencies] entry.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["term", "process", "signal", "poll"] }
+nix = { version = "0.32", features = ["term", "process", "signal", "poll"] }
 
 # Approved 2026-07-23, see docs/crate-checklist.md ("rustlogger: native Windows
 # pty/console handling (chunk 9)"). Both target-gated to cfg(windows) only -
